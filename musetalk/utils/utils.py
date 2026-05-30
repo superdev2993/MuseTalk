@@ -52,26 +52,29 @@ def datagen(
     batch_size=8,
     delay_frame=0,
     device="cuda:0",
+    first_batch_size=None,
 ):
     whisper_batch, latent_batch = [], []
+    current_batch_size = first_batch_size if first_batch_size is not None else batch_size
+
+    def _emit():
+        nonlocal whisper_batch, latent_batch
+        stacked_whisper = torch.stack(whisper_batch)
+        stacked_latent = torch.cat(latent_batch, dim=0)
+        whisper_batch, latent_batch = [], []
+        return stacked_whisper, stacked_latent
+
     for i, w in enumerate(whisper_chunks):
-        idx = (i+delay_frame)%len(vae_encode_latents)
-        latent = vae_encode_latents[idx]
+        idx = (i + delay_frame) % len(vae_encode_latents)
         whisper_batch.append(w)
-        latent_batch.append(latent)
+        latent_batch.append(vae_encode_latents[idx])
 
-        if len(latent_batch) >= batch_size:
-            whisper_batch = torch.stack(whisper_batch)
-            latent_batch = torch.cat(latent_batch, dim=0)
-            yield whisper_batch, latent_batch
-            whisper_batch, latent_batch  = [], []
+        if len(latent_batch) >= current_batch_size:
+            yield _emit()
+            current_batch_size = batch_size
 
-    # the last batch may smaller than batch size
-    if len(latent_batch) > 0:
-        whisper_batch = torch.stack(whisper_batch)
-        latent_batch = torch.cat(latent_batch, dim=0)
-
-        yield whisper_batch.to(device), latent_batch.to(device)
+    if latent_batch:
+        yield _emit()
 
 def cast_training_params(
     model: Union[torch.nn.Module, List[torch.nn.Module]],

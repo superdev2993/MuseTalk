@@ -222,7 +222,9 @@ class Avatar:
         print(video_len)
         frame_interval = 1.0 / stream_fps if stream_fps else None
         while True:
-            if _is_cancelled() or self.idx >= video_len - 1:
+            if _is_cancelled():
+                break
+            if self.idx >= video_len:
                 break
             try:
                 loop_start = time.time()
@@ -230,8 +232,11 @@ class Avatar:
             except queue.Empty:
                 continue
 
+            if res_frame is None:
+                break
+
             bbox = self.coord_list_cycle[self.idx % (len(self.coord_list_cycle))]
-            ori_frame = copy.deepcopy(self.frame_list_cycle[self.idx % (len(self.frame_list_cycle))])
+            ori_frame = self.frame_list_cycle[self.idx % (len(self.frame_list_cycle))].copy()
             x1, y1, x2, y2 = bbox
             try:
                 res_frame = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1))
@@ -252,12 +257,23 @@ class Avatar:
             self.idx = self.idx + 1
 
     @torch.no_grad()
-    def inference(self, audio_path, out_vid_name, fps, skip_save_images, frame_sink=None, stream_fps=None):
+    def inference(
+        self,
+        audio_path,
+        out_vid_name,
+        fps,
+        skip_save_images,
+        frame_sink=None,
+        stream_fps=None,
+        batch_size=None,
+        first_batch_size=None,
+    ):
         os.makedirs(self.avatar_path + '/tmp', exist_ok=True)
         print("start inference")
+        effective_batch_size = batch_size if batch_size is not None else self.batch_size
+        effective_first_batch_size = first_batch_size if first_batch_size is not None else effective_batch_size
         ############################################## extract audio feature ##############################################
         start_time = time.time()
-        # Extract audio features
         whisper_input_features, librosa_length = audio_processor.get_audio_feature(audio_path, weight_dtype=weight_dtype)
         whisper_chunks = audio_processor.get_whisper_chunk(
             whisper_input_features,
@@ -272,36 +288,53 @@ class Avatar:
         print(f"processing audio:{audio_path} costs {(time.time() - start_time) * 1000}ms")
         ############################################## inference batch by batch ##############################################
         video_num = len(whisper_chunks)
+        if video_num == 0:
+            print("No audio frames to process.")
+            return
         res_frame_queue = queue.Queue()
         self.idx = 0
-        # Create a sub-thread and start it
         process_thread = threading.Thread(
             target=self.process_frames,
             args=(res_frame_queue, video_num, skip_save_images, frame_sink, stream_fps),
         )
         process_thread.start()
 
-        gen = datagen(whisper_chunks,
-                     self.input_latent_list_cycle,
-                     self.batch_size)
+        gen = datagen(
+            whisper_chunks,
+            self.input_latent_list_cycle,
+            effective_batch_size,
+            first_batch_size=effective_first_batch_size,
+        )
         start_time = time.time()
-        res_frame_list = []
+        batch_count = 0
+        remaining = video_num
+        expected_batches = 0
+        while remaining > 0:
+            take = effective_first_batch_size if expected_batches == 0 else effective_batch_size
+            take = min(take, remaining)
+            remaining -= take
+            expected_batches += 1
 
-        for i, (whisper_batch, latent_batch) in enumerate(tqdm(gen, total=int(np.ceil(float(video_num) / self.batch_size)))):
+        for whisper_batch, latent_batch in tqdm(gen, total=expected_batches):
             if _is_cancelled():
                 break
-            audio_feature_batch = pe(whisper_batch.to(device))
-            latent_batch = latent_batch.to(device=device, dtype=unet.model.dtype)
+            batch_count += 1
+            audio_feature_batch = pe(whisper_batch.to(device, non_blocking=True))
+            latent_batch = latent_batch.to(device=device, dtype=unet.model.dtype, non_blocking=True)
 
-            pred_latents = unet.model(latent_batch,
-                                    timesteps,
-                                    encoder_hidden_states=audio_feature_batch).sample
+            pred_latents = unet.model(
+                latent_batch,
+                timesteps,
+                encoder_hidden_states=audio_feature_batch,
+            ).sample
             pred_latents = pred_latents.to(device=device, dtype=vae.vae.dtype)
             recon = vae.decode_latents(pred_latents)
             for res_frame in recon:
                 res_frame_queue.put(res_frame)
-        # Close the queue and sub-thread after all tasks are completed
-        process_thread.join()
+        res_frame_queue.put(None)
+        process_thread.join(timeout=120)
+        if process_thread.is_alive():
+            print(f"WARNING: process_frames thread did not finish within 120s (video_num={video_num}, idx={self.idx})")
 
         if skip_save_images is True:
             print('Total process time of {} frames without saving images = {}s'.format(
