@@ -1,8 +1,12 @@
 """
-Web server: upload video + audio, stream lip-sync output to the browser (MJPEG).
+Web server: upload video + audio, stream lip-sync output to the browser.
 
-Face analysis results are cached per video file. Re-uploading the same video
-with a different audio skips avatar preparation and starts streaming faster.
+Video and audio are muxed with FFmpeg into a fragmented MP4 stream served
+via HTTP so the browser plays them in sync from a single <video> element.
+
+Face analysis results are cached per video file (on disk and in memory).
+Re-uploading the same reference video reuses the loaded face model without
+reloading or re-analyzing.
 
 Open http://127.0.0.1:8080/ after starting this script.
 """
@@ -14,6 +18,7 @@ import mimetypes
 import json
 import os
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -55,16 +60,17 @@ INDEX_HTML = """<!DOCTYPE html>
     #status { min-height: 1.4em; color: #93c5fd; margin-top: 12px; white-space: pre-wrap; }
     .hint { color: #64748b; font-size: 0.9rem; margin-top: 8px; }
     .stream-wrap { background: #000; border-radius: 12px; overflow: hidden; min-height: 360px; display: flex; align-items: center; justify-content: center; position: relative; }
-    #stream { width: 100%; display: block; background: #000; min-height: 360px; object-fit: contain; }
+    #preview { width: 100%; display: block; background: #000; min-height: 360px; object-fit: contain; }
+    #player { width: 100%; display: block; background: #000; min-height: 360px; object-fit: contain; }
     .placeholder { color: #64748b; padding: 48px; text-align: center; position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; }
-    #player { width: 100%; margin-top: 12px; }
   </style>
 </head>
 <body>
   <main>
     <h1>MuseTalk Live Streaming</h1>
     <p class="sub">Upload a reference video and a driving audio clip to preview lip-synced output in your browser.<br>
-    Reusing the same video skips face analysis and only processes the new audio.</p>
+    Reusing the same reference video reuses the loaded face model. Video and audio
+    stream progressively as frames are generated (fragmented MP4).</p>
 
     <section class="panel">
       <form id="upload-form">
@@ -76,13 +82,14 @@ INDEX_HTML = """<!DOCTYPE html>
 
         <button id="submit-btn" type="submit">Start streaming</button>
         <div id="status">Connecting to server...</div>
+        <div id="conn-hint" class="hint"></div>
         <div class="hint">First upload: face analysis takes 1–3 min · Same video again: only audio is processed</div>
       </form>
-      <audio id="player" controls style="display:none"></audio>
     </section>
 
     <section class="panel stream-wrap">
-      <img id="stream" alt="stream preview" style="display:none">
+      <video id="player" controls playsinline style="display:none"></video>
+      <img id="preview" alt="status preview" style="display:none">
       <div id="placeholder" class="placeholder">The stream will appear here after upload.</div>
     </section>
   </main>
@@ -90,49 +97,70 @@ INDEX_HTML = """<!DOCTYPE html>
   <script>
     const form = document.getElementById('upload-form');
     const statusEl = document.getElementById('status');
+    const connHint = document.getElementById('conn-hint');
     const submitBtn = document.getElementById('submit-btn');
-    const streamImg = document.getElementById('stream');
+    const previewImg = document.getElementById('preview');
+    const player = document.getElementById('player');
     const placeholder = document.getElementById('placeholder');
-    const audioEl = document.getElementById('player');
     let pollTimer = null;
-    let streamToken = 0;
-    let audioStarted = false;
+    let previewToken = 0;
+    let avToken = 0;
+    let avStarted = false;
     let activeJobId = null;
 
     function setStatus(text) {
       statusEl.textContent = text;
     }
 
-    function startStreamView() {
-      streamToken += 1;
+    connHint.textContent = 'Page URL: ' + window.location.href;
+
+    function startPreview() {
+      previewToken += 1;
       placeholder.style.display = 'none';
-      streamImg.style.display = 'block';
-      streamImg.src = '/stream?t=' + streamToken;
+      player.style.display = 'none';
+      previewImg.style.display = 'block';
+      previewImg.src = '/stream?t=' + previewToken;
     }
 
-    function resetAudio() {
-      audioStarted = false;
+    function startProgressiveStream(data) {
+      if (avStarted || !data.stream_url) return;
+      avToken += 1;
+      placeholder.style.display = 'none';
+      previewImg.style.display = 'none';
+      previewImg.removeAttribute('src');
+      player.style.display = 'block';
+      player.src = data.stream_url + '?t=' + avToken;
+      player.load();
+      player.play().catch(() => {
+        setStatus('Streaming — click Play on the video player.');
+      });
+      avStarted = true;
+    }
+
+    function playResultVideo(data) {
+      if (avStarted || !data.result_url) return;
+      avToken += 1;
+      placeholder.style.display = 'none';
+      previewImg.style.display = 'none';
+      player.style.display = 'block';
+      player.src = data.result_url + '?t=' + avToken;
+      player.load();
+      player.play().catch(() => {
+        setStatus('Video ready — click Play on the video player.');
+      });
+      avStarted = true;
+    }
+
+    function resetStreamView() {
+      avStarted = false;
       activeJobId = null;
-      audioEl.pause();
-      audioEl.removeAttribute('src');
-      audioEl.load();
-      audioEl.style.display = 'none';
-    }
-
-    function tryStartAudio(data) {
-      if (audioStarted || !data.audio_url) return;
-      if (!['preparing', 'streaming'].includes(data.state)) return;
-      audioEl.style.display = 'block';
-      if (!audioEl.src || !audioEl.src.endsWith(data.audio_url.split('?')[0])) {
-        audioEl.src = data.audio_url + '?t=' + Date.now();
-        audioEl.load();
-      }
-      if (data.state === 'streaming' && audioEl.paused) {
-        audioEl.play().catch(() => {
-          setStatus((data.message || 'Streaming') + ' — click Play on the audio bar below to hear sound.');
-        });
-        audioStarted = true;
-      }
+      player.pause();
+      player.removeAttribute('src');
+      player.load();
+      player.style.display = 'none';
+      previewImg.style.display = 'none';
+      previewImg.removeAttribute('src');
+      placeholder.style.display = 'flex';
     }
 
     async function pollStatus() {
@@ -144,12 +172,17 @@ INDEX_HTML = """<!DOCTYPE html>
         submitBtn.disabled = ['preparing', 'streaming', 'loading', 'uploading'].includes(data.state);
         if (data.job_id && data.job_id !== activeJobId) {
           activeJobId = data.job_id;
-          audioStarted = false;
+          avStarted = false;
         }
-        if (['preparing', 'streaming'].includes(data.state)) {
-          if (streamImg.style.display === 'none') startStreamView();
+        if (data.state === 'preparing') {
+          if (previewImg.style.display === 'none' && player.style.display === 'none') startPreview();
         }
-        tryStartAudio(data);
+        if (data.state === 'streaming') {
+          startProgressiveStream(data);
+        }
+        if (data.state === 'done' && !avStarted) {
+          playResultVideo(data);
+        }
         if (['idle', 'done', 'error', 'cancelled'].includes(data.state)) {
           submitBtn.disabled = false;
         }
@@ -169,9 +202,9 @@ INDEX_HTML = """<!DOCTYPE html>
       }
 
       submitBtn.disabled = true;
-      resetAudio();
+      resetStreamView();
       setStatus('Uploading files...');
-      startStreamView();
+      startPreview();
 
       const body = new FormData();
       body.append('video', video);
@@ -286,42 +319,282 @@ def is_avatar_ready(args, avatar_id):
     return all(os.path.exists(p) for p in required)
 
 
+class ProgressiveMP4Buffer:
+    """Thread-safe buffer for fragmented MP4 bytes emitted by FFmpeg."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
+        self._chunks = []
+        self._closed = False
+
+    def append(self, data: bytes):
+        if not data:
+            return
+        with self._cond:
+            self._chunks.append(data)
+            self._cond.notify_all()
+
+    def close(self):
+        with self._cond:
+            self._closed = True
+            self._cond.notify_all()
+
+    def iter_chunks(self):
+        idx = 0
+        while True:
+            with self._cond:
+                while idx >= len(self._chunks) and not self._closed:
+                    self._cond.wait(timeout=1.0)
+                if idx >= len(self._chunks):
+                    if self._closed:
+                        break
+                    continue
+                chunk = self._chunks[idx]
+                idx += 1
+            yield chunk
+
+    def get_all_bytes(self):
+        with self._lock:
+            return b"".join(self._chunks)
+
+
+class FFmpegProgressiveStreamer:
+    """Mux BGR frames + audio into fragmented MP4 (pipe) for progressive HTTP streaming."""
+
+    def __init__(self, fps: int, audio_path: str, buffer: ProgressiveMP4Buffer, output_path: str):
+        self.fps = fps
+        self.audio_path = audio_path
+        self.buffer = buffer
+        self.output_path = output_path
+        self._proc = None
+        self._reader = None
+        self._started = False
+        self._lock = threading.Lock()
+        self._error = None
+
+    @staticmethod
+    def _even_dim(n: int) -> int:
+        return n if n % 2 == 0 else n - 1
+
+    def _start(self, width: int, height: int):
+        width = self._even_dim(width)
+        height = self._even_dim(height)
+        os.makedirs(os.path.dirname(self.output_path), exist_ok=True)
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr24",
+            "-s",
+            f"{width}x{height}",
+            "-r",
+            str(self.fps),
+            "-i",
+            "pipe:0",
+            "-i",
+            self.audio_path,
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-tune",
+            "zerolatency",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-shortest",
+            "-f",
+            "mp4",
+            "-movflags",
+            "frag_keyframe+empty_moov+default_base_moof",
+            "pipe:1",
+        ]
+        self._proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self._reader = threading.Thread(target=self._read_stdout, daemon=True)
+        self._reader.start()
+        self._started = True
+        print(f"Progressive MP4 encoder started ({width}x{height} @ {self.fps} fps)")
+
+    def _read_stdout(self):
+        try:
+            while True:
+                chunk = self._proc.stdout.read(65536)
+                if not chunk:
+                    break
+                self.buffer.append(chunk)
+        except Exception as exc:
+            self._error = exc
+        finally:
+            self.buffer.close()
+
+    def write_frame(self, frame_bgr: np.ndarray):
+        with self._lock:
+            if self._error:
+                return
+            h, w = frame_bgr.shape[:2]
+            w, h = self._even_dim(w), self._even_dim(h)
+            if frame_bgr.shape[0] != h or frame_bgr.shape[1] != w:
+                frame_bgr = frame_bgr[:h, :w]
+            if not self._started:
+                self._start(w, h)
+            try:
+                self._proc.stdin.write(frame_bgr.tobytes())
+            except (BrokenPipeError, OSError) as exc:
+                self._error = exc
+
+    def finish(self):
+        with self._lock:
+            if self._proc is None:
+                self.buffer.close()
+                return
+            try:
+                if self._proc.stdin:
+                    self._proc.stdin.close()
+            except OSError:
+                pass
+            if self._reader is not None:
+                self._reader.join(timeout=60)
+            try:
+                self._proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+            if self._proc.stderr:
+                err = self._proc.stderr.read().decode("utf-8", errors="replace").strip()
+                if err and self._proc.returncode not in (0, None):
+                    print(f"FFmpeg progressive MP4 warning: {err[:500]}")
+            if not self.buffer._closed:
+                self.buffer.close()
+            data = self.buffer.get_all_bytes()
+            if data:
+                with open(self.output_path, "wb") as f:
+                    f.write(data)
+                print(f"Progressive MP4 saved: {self.output_path} ({len(data)} bytes)")
+
+
 class StreamWebService:
     def __init__(self, args):
         self.args = args
         self._lock = threading.Lock()
         self._latest_frame = None
         self._frame_event = threading.Event()
-        self._status = {"state": "loading", "message": "Loading models...", "cached": False, "job_id": None, "audio_url": None}
+        self._status = {"state": "loading", "message": "Loading models...", "cached": False, "job_id": None, "stream_url": None, "result_url": None}
         self._cancel_event = threading.Event()
         self._worker = None
         self._running = False
         self._models_ready = threading.Event()
         self._job_audio_paths = {}
+        self._av_encoder = None
+        self._av_audio_path = None
+        self._av_output_path = None
+        self._mp4_buffer = None
+        self._job_mp4_buffers = {}
+        self._current_job_id = None
+        self._mux_frames = False
+        self._avatar_cache = {}  # video_hash -> Avatar (kept while reference video unchanged)
 
-    def set_status(self, state, message, cached=False, job_id=None, audio_url=None):
+    def _get_or_create_avatar(self, video_path, avatar_id, need_preparation, video_hash):
+        """Return cached in-memory avatar when the reference video is unchanged."""
+        cached = self._avatar_cache.get(video_hash)
+        if cached is not None and not need_preparation:
+            cached.idx = 0
+            print(f"Reusing in-memory face model: {avatar_id}")
+            return cached, True
+
+        if not need_preparation:
+            self.set_status("preparing", "Loading face model from disk...", cached=True)
+            self.push_status_frame("Loading face model...")
+        else:
+            self.set_status("preparing", "Preparing avatar (face analysis)...", cached=False)
+            self.push_status_frame("Preparing avatar...")
+
+        avatar = Avatar(
+            avatar_id=avatar_id,
+            video_path=video_path,
+            bbox_shift=0,
+            batch_size=self.args.batch_size,
+            preparation=need_preparation,
+            non_interactive=True,
+        )
+        self._avatar_cache[video_hash] = avatar
+        return avatar, False
+
+    def set_status(self, state, message, cached=False, job_id=None, stream_url=None, result_url=None):
         with self._lock:
-            status = {"state": state, "message": message, "cached": cached}
+            status = {"state": state, "message": message, "cached": cached, "stream_url": None, "result_url": None}
             if job_id is not None:
                 status["job_id"] = job_id
             elif "job_id" in self._status:
                 status["job_id"] = self._status.get("job_id")
-            if audio_url is not None:
-                status["audio_url"] = audio_url
-            elif "audio_url" in self._status:
-                status["audio_url"] = self._status.get("audio_url")
+            if stream_url is not None:
+                status["stream_url"] = stream_url
+            elif "stream_url" in self._status:
+                status["stream_url"] = self._status.get("stream_url")
+            if result_url is not None:
+                status["result_url"] = result_url
+            elif "result_url" in self._status:
+                status["result_url"] = self._status.get("result_url")
             self._status = status
         print(f"[{state}] {message}")
+
+    def _reset_av_stream(self, job_id, audio_path):
+        if self._av_encoder is not None:
+            self._av_encoder.finish()
+        self._av_encoder = None
+        self._current_job_id = job_id
+        self._av_audio_path = audio_path
+        self._av_output_path = os.path.join(UPLOAD_ROOT, job_id, "output.mp4")
+        self._mp4_buffer = ProgressiveMP4Buffer()
+        self._job_mp4_buffers[job_id] = self._mp4_buffer
+        if os.path.isfile(self._av_output_path):
+            os.remove(self._av_output_path)
+        self._mux_frames = False
+
+    def _begin_av_mux(self):
+        self._mux_frames = True
+
+    def _finish_av_stream(self):
+        self._mux_frames = False
+        if self._av_encoder is not None:
+            self._av_encoder.finish()
+            self._av_encoder = None
 
     def get_status(self):
         with self._lock:
             return dict(self._status)
 
     def push_frame(self, frame_bgr: np.ndarray):
-        """Store a BGR frame (same format as OpenCV / get_image_blending output)."""
+        """Store a BGR frame for MJPEG preview and optionally mux into AV stream."""
         with self._lock:
             self._latest_frame = frame_bgr.copy()
         self._frame_event.set()
+
+        if self._mux_frames and self._av_audio_path and self._av_output_path and self._mp4_buffer is not None:
+            if self._av_encoder is None:
+                self._av_encoder = FFmpegProgressiveStreamer(
+                    self.args.fps,
+                    self._av_audio_path,
+                    self._mp4_buffer,
+                    self._av_output_path,
+                )
+            self._av_encoder.write_frame(frame_bgr)
 
     def push_status_frame(self, text):
         img = np.zeros((480, 854, 3), dtype=np.uint8)
@@ -389,25 +662,14 @@ class StreamWebService:
         }
         save_cache_index(cache_index)
 
-    def _run_job(self, video_path, audio_path, avatar_id, need_preparation, video_hash, use_cache):
+    def _run_job(self, video_path, audio_path, avatar_id, need_preparation, video_hash, use_cache, job_id):
         import scripts.realtime_inference as rt
 
         try:
-            if use_cache:
-                self.set_status("preparing", "Loading cached face analysis...", cached=True)
-                self.push_status_frame("Loading cached avatar...")
-            else:
-                self.set_status("preparing", "Preparing avatar (face analysis)...", cached=False)
-                self.push_status_frame("Preparing avatar...")
-
-            avatar = Avatar(
-                avatar_id=avatar_id,
-                video_path=video_path,
-                bbox_shift=0,
-                batch_size=self.args.batch_size,
-                preparation=need_preparation,
-                non_interactive=True,
+            avatar, memory_cached = self._get_or_create_avatar(
+                video_path, avatar_id, need_preparation, video_hash
             )
+            use_cache = use_cache or memory_cached
 
             if need_preparation and not self._cancel_event.is_set():
                 self._register_cache(video_hash, avatar_id, video_path)
@@ -416,21 +678,44 @@ class StreamWebService:
                 self.set_status("cancelled", "Job cancelled.", cached=use_cache)
                 return
 
-            self.set_status("streaming", "Generating lip-sync stream...", cached=use_cache)
-            avatar.inference(
-                audio_path,
-                None,
-                self.args.fps,
-                skip_save_images=True,
-                frame_sink=self,
-                stream_fps=self.args.fps,
-            )
+            stream_url = f"/api/progressive/{job_id}.mp4"
+            result_url = f"/api/result/{job_id}.mp4"
+            if memory_cached:
+                self.set_status(
+                    "streaming",
+                    "Reusing face model — progressive A/V stream starting...",
+                    cached=True,
+                    job_id=job_id,
+                    stream_url=stream_url,
+                    result_url=result_url,
+                )
+            else:
+                self.set_status(
+                    "streaming",
+                    "Progressive A/V stream in progress (video + audio)...",
+                    cached=use_cache,
+                    job_id=job_id,
+                    stream_url=stream_url,
+                    result_url=result_url,
+                )
+            self._begin_av_mux()
+            try:
+                avatar.inference(
+                    audio_path,
+                    None,
+                    self.args.fps,
+                    skip_save_images=True,
+                    frame_sink=self,
+                    stream_fps=self.args.fps,
+                )
+            finally:
+                self._finish_av_stream()
 
             if self._cancel_event.is_set():
                 self.set_status("cancelled", "Job cancelled.", cached=use_cache)
             else:
-                msg = "Streaming finished. Upload the same video with different audio to try again."
-                self.set_status("done", msg, cached=use_cache)
+                msg = "Stream complete. Upload again to try another clip."
+                self.set_status("done", msg, cached=use_cache, result_url=result_url)
         except Exception as exc:
             self.set_status("error", f"Processing error: {exc}", cached=use_cache)
             self.push_status_frame("Error: " + str(exc)[:60])
@@ -438,7 +723,7 @@ class StreamWebService:
         finally:
             rt.args.cancel_event = None
 
-    def start_job(self, video_path, audio_path):
+    def start_job(self, video_path, audio_path, job_id):
         if not self._models_ready.is_set():
             raise RuntimeError("Models are still loading.")
 
@@ -457,11 +742,12 @@ class StreamWebService:
         with self._lock:
             self._latest_frame = None
         self._frame_event.clear()
+        self._reset_av_stream(job_id, audio_path)
         self.push_status_frame("Starting...")
 
         self._worker = threading.Thread(
             target=self._run_job,
-            args=(video_path, audio_path, avatar_id, need_preparation, video_hash, use_cache),
+            args=(video_path, audio_path, avatar_id, need_preparation, video_hash, use_cache, job_id),
             daemon=True,
         )
         self._worker.start()
@@ -485,29 +771,32 @@ class StreamWebService:
         job_id = uuid.uuid4().hex
         video_path, audio_path = self._save_upload(form, job_id)
         self._job_audio_paths[job_id] = audio_path
-        avatar_id, need_preparation, _ = self._resolve_avatar(video_path)
-        audio_url = f"/api/audio/{job_id}"
+        avatar_id, need_preparation, video_hash = self._resolve_avatar(video_path)
+        memory_cached = video_hash in self._avatar_cache and not need_preparation
 
-        if need_preparation:
-            message = "Upload complete. Running face analysis, then streaming will start."
+        if memory_cached:
+            message = "Upload complete. Reusing loaded face model — starting stream."
+        elif need_preparation:
+            message = "Upload complete. Running face analysis, then A/V streaming will start."
         else:
-            message = "Upload complete. Using cached face analysis — streaming audio now."
+            message = "Upload complete. Loading face model from disk — then streaming."
 
         self.set_status(
             "uploading",
             message,
             cached=not need_preparation,
             job_id=job_id,
-            audio_url=audio_url,
         )
-        self.start_job(video_path, audio_path)
+        self.start_job(video_path, audio_path, job_id)
 
         return {
             "ok": True,
             "job_id": job_id,
             "avatar_id": avatar_id,
             "cached": not need_preparation,
-            "audio_url": audio_url,
+            "memory_cached": memory_cached,
+            "stream_url": f"/api/progressive/{job_id}.mp4",
+            "result_url": f"/api/result/{job_id}.mp4",
             "message": message,
         }
 
@@ -542,8 +831,72 @@ class StreamWebService:
                     self.wfile.write(body)
                     return
 
+                if path == "/health":
+                    self._send_json({"ok": True, "state": service.get_status().get("state")})
+                    return
+
                 if path == "/api/status":
                     self._send_json(service.get_status())
+                    return
+
+                if path.startswith("/api/progressive/"):
+                    job_id = path.replace("/api/progressive/", "").replace(".mp4", "")
+                    buffer = service._job_mp4_buffers.get(job_id)
+                    if buffer is None:
+                        self.send_error(404)
+                        return
+                    self.send_response(200)
+                    self.send_header("Content-Type", "video/mp4")
+                    self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+                    self.send_header("Pragma", "no-cache")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    try:
+                        for chunk in buffer.iter_chunks():
+                            self.wfile.write(chunk)
+                            self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                        pass
+                    return
+
+                if path.startswith("/api/result/"):
+                    job_id = path.replace("/api/result/", "").replace(".mp4", "")
+                    fpath = os.path.join(UPLOAD_ROOT, job_id, "output.mp4")
+                    if not os.path.isfile(fpath) or os.path.getsize(fpath) == 0:
+                        self.send_error(404)
+                        return
+                    file_size = os.path.getsize(fpath)
+                    range_header = self.headers.get("Range")
+                    if range_header:
+                        try:
+                            units, rng = range_header.split("=")
+                            start_s, end_s = rng.split("-")
+                            start = int(start_s) if start_s else 0
+                            end = int(end_s) if end_s else file_size - 1
+                            end = min(end, file_size - 1)
+                        except ValueError:
+                            self.send_error(416)
+                            return
+                        with open(fpath, "rb") as f:
+                            f.seek(start)
+                            data = f.read(end - start + 1)
+                        self.send_response(206)
+                        self.send_header("Content-Type", "video/mp4")
+                        self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+                        self.send_header("Content-Length", str(len(data)))
+                        self.send_header("Accept-Ranges", "bytes")
+                        self.end_headers()
+                        self.wfile.write(data)
+                        return
+                    with open(fpath, "rb") as f:
+                        data = f.read()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "video/mp4")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.end_headers()
+                    self.wfile.write(data)
                     return
 
                 if path.startswith("/api/audio/"):
@@ -617,7 +970,7 @@ class StreamWebService:
 def parse_args():
     parser = argparse.ArgumentParser(description="MuseTalk upload + streaming web server")
     parser.add_argument("--host", type=str, default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--port", type=int, default=7860)
     parser.add_argument("--gpu_id", type=int, default=0)
     parser.add_argument("--version", type=str, default="v15", choices=["v1", "v15"])
     parser.add_argument("--ffmpeg_path", type=str, default="./ffmpeg-4.4-amd64-static/")

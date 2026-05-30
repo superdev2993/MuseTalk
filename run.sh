@@ -16,7 +16,7 @@ Commands:
   inference       Run MuseTalk 1.5 normal inference (sample data)
   realtime        Run MuseTalk 1.5 realtime inference
   stream          Live MJPEG stream (config file, http://127.0.0.1:8080)
-  stream-web      Upload web UI + live streaming (http://127.0.0.1:8080)
+  stream-web      Upload web UI + live streaming (http://127.0.0.1:7860)
   gradio          Launch Gradio web UI (http://127.0.0.1:7860)
   gradio-fp16     Launch Gradio web UI with fp16 (faster, less VRAM)
 
@@ -62,7 +62,7 @@ case "${1:-}" in
       --version v15 \
       --fps 25 \
       --host 0.0.0.0 \
-      --port 8080
+      --port 7860
     ;;
   gradio)
     "$PYTHON" app.py --ip 0.0.0.0 --port 7860
