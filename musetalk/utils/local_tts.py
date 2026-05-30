@@ -184,18 +184,31 @@ def wav_to_pcm_s16le(wav_path: str) -> Tuple[bytes, int]:
 
 
 def resample_wav_for_whisper(src_wav: str, dst_wav: str, sample_rate: int = WHISPER_SAMPLE_RATE):
-    import numpy as np
-
-    audio, sr = sf.read(src_wav, dtype="float32")
-    if audio.ndim > 1:
-        audio = audio.mean(axis=1)
-    if sr != sample_rate:
-        duration = len(audio) / sr
-        target_len = max(1, int(round(duration * sample_rate)))
-        x_old = np.linspace(0.0, duration, num=len(audio), endpoint=False)
-        x_new = np.linspace(0.0, duration, num=target_len, endpoint=False)
-        audio = np.interp(x_new, x_old, audio).astype(np.float32)
+    audio, _ = librosa.load(src_wav, sr=sample_rate, mono=True)
     sf.write(dst_wav, audio, sample_rate)
+
+
+def prepare_tts_chunk_for_inference(
+    text: str,
+    raw_wav: str,
+    whisper_wav: str,
+    voice: str = DEFAULT_VOICE,
+    model_dir: str = DEFAULT_MODEL_DIR,
+    use_cuda: bool = False,
+) -> dict:
+    """Synthesize, resample for Whisper, and load mux PCM in one worker call."""
+    sr, _ = synthesize_chunk_to_wav(
+        text, raw_wav, voice=voice, model_dir=model_dir, use_cuda=use_cuda
+    )
+    resample_wav_for_whisper(raw_wav, whisper_wav)
+    pcm_bytes, pcm_sr = wav_to_pcm_s16le(raw_wav)
+    return {
+        "raw_wav": raw_wav,
+        "whisper_wav": whisper_wav,
+        "sample_rate": sr,
+        "pcm_bytes": pcm_bytes,
+        "pcm_sr": pcm_sr,
+    }
 
 
 def synthesize_speech(

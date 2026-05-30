@@ -41,6 +41,7 @@ from musetalk.utils.tts import (
     chunk_text_for_streaming,
     concat_wavs,
     get_tts_engine,
+    prepare_tts_chunk_for_inference,
     resample_wav_for_whisper,
     synthesize_chunk_to_wav,
     synthesize_speech,
@@ -809,19 +810,33 @@ INDEX_HTML = """<!DOCTYPE html>
 
 
 def autotune_batch_sizes(args, device):
-    """Raise avatar prep batch size when VRAM headroom allows (streaming batches stay as configured)."""
+    """Raise batch sizes when VRAM headroom allows (avatar prep + streaming inference)."""
     if not torch.cuda.is_available():
         return
     idx = device.index if device.index is not None else 0
     free, total = torch.cuda.mem_get_info(idx)
     gb_free = free / (1024 ** 3)
-    if gb_free >= 8:
+    gb_total = total / (1024 ** 3)
+    if gb_free >= 40 or gb_total >= 70:
+        args.batch_size = max(args.batch_size, 64)
+        args.stream_batch_size = max(args.stream_batch_size, 48)
+        args.stream_first_batch_size = max(args.stream_first_batch_size, 12)
+    elif gb_free >= 20:
         args.batch_size = max(args.batch_size, 40)
-    elif gb_free >= 5:
+        args.stream_batch_size = max(args.stream_batch_size, 32)
+        args.stream_first_batch_size = max(args.stream_first_batch_size, 8)
+    elif gb_free >= 8:
         args.batch_size = max(args.batch_size, 24)
+        args.stream_batch_size = max(args.stream_batch_size, 16)
+        args.stream_first_batch_size = max(args.stream_first_batch_size, 8)
+    elif gb_free >= 5:
+        args.batch_size = max(args.batch_size, 16)
+        args.stream_batch_size = max(args.stream_batch_size, 12)
+        args.stream_first_batch_size = max(args.stream_first_batch_size, 6)
     print(
-        f"VRAM {gb_free:.1f}GB free / {total / (1024 ** 3):.1f}GB — "
-        f"stream_batch={args.stream_batch_size}, first_batch={args.stream_first_batch_size}",
+        f"VRAM {gb_free:.1f}GB free / {gb_total:.1f}GB total — "
+        f"stream_batch={args.stream_batch_size}, first_batch={args.stream_first_batch_size}, "
+        f"avatar_batch={args.batch_size}",
         flush=True,
     )
 
@@ -2187,6 +2202,18 @@ class StreamWebService:
         }
         save_cache_index(cache_index)
 
+    def _prepare_tts_chunk(self, idx, chunk_text, voice, upload_dir, use_cuda):
+        raw_wav = os.path.join(upload_dir, f"chunk_{idx:03d}.wav")
+        whisper_wav = os.path.join(upload_dir, f"chunk_{idx:03d}_16k.wav")
+        return prepare_tts_chunk_for_inference(
+            chunk_text,
+            raw_wav,
+            whisper_wav,
+            voice=voice,
+            model_dir=self.args.piper_model_dir,
+            use_cuda=use_cuda,
+        )
+
     def _run_chunked_text_job(
         self,
         text,
@@ -2197,8 +2224,6 @@ class StreamWebService:
         use_cache,
         memory_cached,
     ):
-        import scripts.realtime_inference as rt
-
         chunks = chunk_text_for_streaming(
             text,
             first_max_chars=self.args.tts_first_chunk_chars,
@@ -2227,43 +2252,36 @@ class StreamWebService:
         timer.mark("mux_started")
 
         chunk_wavs = []
-        prefetch = ThreadPoolExecutor(max_workers=2)
         use_cuda = self._tts_use_cuda()
+        prefetch_ahead = max(1, self.args.tts_prefetch_chunks)
+        max_workers = min(self.args.tts_prefetch_workers, len(chunks))
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        futures = {}
 
-        def synth_chunk(idx, chunk_text):
-            raw_wav = os.path.join(upload_dir, f"chunk_{idx:03d}.wav")
-            sr, _ = synthesize_chunk_to_wav(
-                chunk_text,
-                raw_wav,
-                voice=voice,
-                model_dir=self.args.piper_model_dir,
-                use_cuda=use_cuda,
-            )
-            return raw_wav, sr
+        def schedule(i):
+            if 0 <= i < len(chunks) and i not in futures:
+                futures[i] = executor.submit(
+                    self._prepare_tts_chunk, i, chunks[i], voice, upload_dir, use_cuda
+                )
 
-        pending = prefetch.submit(synth_chunk, 0, chunks[0])
         try:
-            for idx, chunk_text in enumerate(chunks):
+            for idx in range(len(chunks)):
                 if self._cancel_event.is_set():
                     break
                 frame_idx_before = len(self._frame_archive)
-                if idx + 1 < len(chunks):
-                    next_pending = prefetch.submit(synth_chunk, idx + 1, chunks[idx + 1])
-                else:
-                    next_pending = None
+                for ahead_i in range(idx, min(idx + prefetch_ahead + 1, len(chunks))):
+                    schedule(ahead_i)
 
-                raw_wav, sample_rate = pending.result()
-                timer.mark(f"tts_chunk_{idx}")
+                prepared = futures.pop(idx).result()
+                raw_wav = prepared["raw_wav"]
+                whisper_wav = prepared["whisper_wav"]
+                sample_rate = prepared["sample_rate"]
+                timer.mark(f"tts_ready_chunk_{idx}")
                 self._tts_sample_rate = sample_rate
                 chunk_wavs.append(raw_wav)
 
-                whisper_wav = os.path.join(upload_dir, f"chunk_{idx:03d}_16k.wav")
-                resample_wav_for_whisper(raw_wav, whisper_wav)
-                timer.mark(f"resample_chunk_{idx}")
-
                 if self._piped_mux:
-                    pcm_bytes, pcm_sr = self._load_wav_pcm(raw_wav)
-                    self._enqueue_chunk_audio(pcm_bytes, pcm_sr)
+                    self._enqueue_chunk_audio(prepared["pcm_bytes"], prepared["pcm_sr"])
                 if self._live_segment_mux:
                     self._prepare_chunk_stream(raw_wav, sample_rate, frame_idx_before)
 
@@ -2291,10 +2309,8 @@ class StreamWebService:
                     if chunk_frames:
                         self._append_chunk_segment(chunk_frames, raw_wav)
                         timer.mark(f"segment_mux_chunk_{idx}")
-
-                pending = next_pending
         finally:
-            prefetch.shutdown(wait=False, cancel_futures=True)
+            executor.shutdown(wait=False, cancel_futures=True)
 
         timer.mark("concat_audio")
         full_audio = os.path.join(upload_dir, "audio.wav")
@@ -2902,6 +2918,18 @@ def parse_args():
     parser.add_argument("--tts_first_chunk_chars", type=int, default=18, help="Max chars in first TTS chunk for low latency")
     parser.add_argument("--tts_chunk_chars", type=int, default=96, help="Max chars per follow-up TTS chunk")
     parser.add_argument(
+        "--tts_prefetch_workers",
+        type=int,
+        default=4,
+        help="Parallel Piper TTS workers (overlap synthesis with lip-sync inference)",
+    )
+    parser.add_argument(
+        "--tts_prefetch_chunks",
+        type=int,
+        default=4,
+        help="Number of upcoming text chunks to pre-synthesize ahead of inference",
+    )
+    parser.add_argument(
         "--ffmpeg_gpu",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -2942,6 +2970,11 @@ def main():
     print(
         f"Progressive MP4 mode: {args.progressive_mode} "
         f"(fMP4 frag={args.fmp4_frag_us}us, emit_every={args.stream_emit_frames} frames in segment mode)",
+        flush=True,
+    )
+    print(
+        f"TTS pipeline: prefetch_workers={args.tts_prefetch_workers}, "
+        f"prefetch_chunks={args.tts_prefetch_chunks}, gpu={args.tts_gpu}",
         flush=True,
     )
 

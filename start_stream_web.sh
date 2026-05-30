@@ -22,8 +22,8 @@ nohup "$PYTHON" -m scripts.stream_web_app \
   --progressive_mode piped \
   --fmp4_frag_us 40000 \
   --tts_gpu \
-  --stream_batch_size 8 \
-  --stream_first_batch_size 4 \
+  --tts_prefetch_workers 4 \
+  --tts_prefetch_chunks 4 \
   --stream_emit_frames 1 \
   --batch_size 32 \
   >> "$LOG" 2>&1 &
