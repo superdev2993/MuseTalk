@@ -53,12 +53,18 @@ def osmakedirs(path_list):
         os.makedirs(path) if not os.path.exists(path) else None
 
 
+def _is_cancelled():
+    cancel_event = getattr(args, "cancel_event", None)
+    return cancel_event is not None and cancel_event.is_set()
+
+
 @torch.no_grad()
 class Avatar:
-    def __init__(self, avatar_id, video_path, bbox_shift, batch_size, preparation):
+    def __init__(self, avatar_id, video_path, bbox_shift, batch_size, preparation, non_interactive=False):
         self.avatar_id = avatar_id
         self.video_path = video_path
         self.bbox_shift = bbox_shift
+        self.non_interactive = non_interactive
         # 根据版本设置不同的基础路径
         if args.version == "v15":
             self.base_path = f"./results/{args.version}/avatars/{avatar_id}"
@@ -84,29 +90,36 @@ class Avatar:
         self.idx = 0
         self.init()
 
+    def load_cached_material(self):
+        self.input_latent_list_cycle = torch.load(self.latents_out_path)
+        with open(self.coords_path, 'rb') as f:
+            self.coord_list_cycle = pickle.load(f)
+        input_img_list = glob.glob(os.path.join(self.full_imgs_path, '*.[jpJP][pnPN]*[gG]'))
+        input_img_list = sorted(input_img_list, key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
+        self.frame_list_cycle = read_imgs(input_img_list)
+        with open(self.mask_coords_path, 'rb') as f:
+            self.mask_coords_list_cycle = pickle.load(f)
+        input_mask_list = glob.glob(os.path.join(self.mask_out_path, '*.[jpJP][pnPN]*[gG]'))
+        input_mask_list = sorted(input_mask_list, key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
+        self.mask_list_cycle = read_imgs(input_mask_list)
+
     def init(self):
         if self.preparation:
             if os.path.exists(self.avatar_path):
-                response = input(f"{self.avatar_id} exists, Do you want to re-create it ? (y/n)")
-                if response.lower() == "y":
-                    shutil.rmtree(self.avatar_path)
-                    print("*********************************")
-                    print(f"  creating avator: {self.avatar_id}")
-                    print("*********************************")
-                    osmakedirs([self.avatar_path, self.full_imgs_path, self.video_out_path, self.mask_out_path])
-                    self.prepare_material()
+                if self.non_interactive:
+                    print(f"{self.avatar_id} exists, loading cached avatar materials.")
+                    self.load_cached_material()
                 else:
-                    self.input_latent_list_cycle = torch.load(self.latents_out_path)
-                    with open(self.coords_path, 'rb') as f:
-                        self.coord_list_cycle = pickle.load(f)
-                    input_img_list = glob.glob(os.path.join(self.full_imgs_path, '*.[jpJP][pnPN]*[gG]'))
-                    input_img_list = sorted(input_img_list, key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
-                    self.frame_list_cycle = read_imgs(input_img_list)
-                    with open(self.mask_coords_path, 'rb') as f:
-                        self.mask_coords_list_cycle = pickle.load(f)
-                    input_mask_list = glob.glob(os.path.join(self.mask_out_path, '*.[jpJP][pnPN]*[gG]'))
-                    input_mask_list = sorted(input_mask_list, key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
-                    self.mask_list_cycle = read_imgs(input_mask_list)
+                    response = input(f"{self.avatar_id} exists, Do you want to re-create it ? (y/n)")
+                    if response.lower() == "y":
+                        shutil.rmtree(self.avatar_path)
+                        print("*********************************")
+                        print(f"  creating avator: {self.avatar_id}")
+                        print("*********************************")
+                        osmakedirs([self.avatar_path, self.full_imgs_path, self.video_out_path, self.mask_out_path])
+                        self.prepare_material()
+                    else:
+                        self.load_cached_material()
             else:
                 print("*********************************")
                 print(f"  creating avator: {self.avatar_id}")
@@ -122,28 +135,24 @@ class Avatar:
                 avatar_info = json.load(f)
 
             if avatar_info['bbox_shift'] != self.avatar_info['bbox_shift']:
-                response = input(f" 【bbox_shift】 is changed, you need to re-create it ! (c/continue)")
-                if response.lower() == "c":
+                if self.non_interactive:
+                    print(f"bbox_shift changed for {self.avatar_id}, recreating avatar.")
                     shutil.rmtree(self.avatar_path)
-                    print("*********************************")
-                    print(f"  creating avator: {self.avatar_id}")
-                    print("*********************************")
                     osmakedirs([self.avatar_path, self.full_imgs_path, self.video_out_path, self.mask_out_path])
                     self.prepare_material()
                 else:
-                    sys.exit()
+                    response = input(f" 【bbox_shift】 is changed, you need to re-create it ! (c/continue)")
+                    if response.lower() == "c":
+                        shutil.rmtree(self.avatar_path)
+                        print("*********************************")
+                        print(f"  creating avator: {self.avatar_id}")
+                        print("*********************************")
+                        osmakedirs([self.avatar_path, self.full_imgs_path, self.video_out_path, self.mask_out_path])
+                        self.prepare_material()
+                    else:
+                        sys.exit()
             else:
-                self.input_latent_list_cycle = torch.load(self.latents_out_path)
-                with open(self.coords_path, 'rb') as f:
-                    self.coord_list_cycle = pickle.load(f)
-                input_img_list = glob.glob(os.path.join(self.full_imgs_path, '*.[jpJP][pnPN]*[gG]'))
-                input_img_list = sorted(input_img_list, key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
-                self.frame_list_cycle = read_imgs(input_img_list)
-                with open(self.mask_coords_path, 'rb') as f:
-                    self.mask_coords_list_cycle = pickle.load(f)
-                input_mask_list = glob.glob(os.path.join(self.mask_out_path, '*.[jpJP][pnPN]*[gG]'))
-                input_mask_list = sorted(input_mask_list, key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
-                self.mask_list_cycle = read_imgs(input_mask_list)
+                self.load_cached_material()
 
     def prepare_material(self):
         print("preparing data materials ... ...")
@@ -209,13 +218,14 @@ class Avatar:
 
         torch.save(self.input_latent_list_cycle, os.path.join(self.latents_out_path))
 
-    def process_frames(self, res_frame_queue, video_len, skip_save_images):
+    def process_frames(self, res_frame_queue, video_len, skip_save_images, frame_sink=None, stream_fps=None):
         print(video_len)
+        frame_interval = 1.0 / stream_fps if stream_fps else None
         while True:
-            if self.idx >= video_len - 1:
+            if _is_cancelled() or self.idx >= video_len - 1:
                 break
             try:
-                start = time.time()
+                loop_start = time.time()
                 res_frame = res_frame_queue.get(block=True, timeout=1)
             except queue.Empty:
                 continue
@@ -231,12 +241,18 @@ class Avatar:
             mask_crop_box = self.mask_coords_list_cycle[self.idx % (len(self.mask_coords_list_cycle))]
             combine_frame = get_image_blending(ori_frame,res_frame,bbox,mask,mask_crop_box)
 
+            if frame_sink is not None:
+                frame_sink.push_frame(combine_frame)
+                if frame_interval is not None:
+                    elapsed = time.time() - loop_start
+                    time.sleep(max(0.0, frame_interval - elapsed))
+
             if skip_save_images is False:
                 cv2.imwrite(f"{self.avatar_path}/tmp/{str(self.idx).zfill(8)}.png", combine_frame)
             self.idx = self.idx + 1
 
     @torch.no_grad()
-    def inference(self, audio_path, out_vid_name, fps, skip_save_images):
+    def inference(self, audio_path, out_vid_name, fps, skip_save_images, frame_sink=None, stream_fps=None):
         os.makedirs(self.avatar_path + '/tmp', exist_ok=True)
         print("start inference")
         ############################################## extract audio feature ##############################################
@@ -259,7 +275,10 @@ class Avatar:
         res_frame_queue = queue.Queue()
         self.idx = 0
         # Create a sub-thread and start it
-        process_thread = threading.Thread(target=self.process_frames, args=(res_frame_queue, video_num, skip_save_images))
+        process_thread = threading.Thread(
+            target=self.process_frames,
+            args=(res_frame_queue, video_num, skip_save_images, frame_sink, stream_fps),
+        )
         process_thread.start()
 
         gen = datagen(whisper_chunks,
@@ -269,6 +288,8 @@ class Avatar:
         res_frame_list = []
 
         for i, (whisper_batch, latent_batch) in enumerate(tqdm(gen, total=int(np.ceil(float(video_num) / self.batch_size)))):
+            if _is_cancelled():
+                break
             audio_feature_batch = pe(whisper_batch.to(device))
             latent_batch = latent_batch.to(device=device, dtype=unet.model.dtype)
 
@@ -282,7 +303,7 @@ class Avatar:
         # Close the queue and sub-thread after all tasks are completed
         process_thread.join()
 
-        if args.skip_save_images is True:
+        if skip_save_images is True:
             print('Total process time of {} frames without saving images = {}s'.format(
                 video_num,
                 time.time() - start_time))
@@ -291,7 +312,7 @@ class Avatar:
                 video_num,
                 time.time() - start_time))
 
-        if out_vid_name is not None and args.skip_save_images is False:
+        if out_vid_name is not None and skip_save_images is False:
             # optional
             cmd_img2video = f"ffmpeg -y -v warning -r {fps} -f image2 -i {self.avatar_path}/tmp/%08d.png -vcodec libx264 -vf format=yuv420p -crf 18 {self.avatar_path}/temp.mp4"
             print(cmd_img2video)

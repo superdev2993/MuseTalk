@@ -1,0 +1,6 @@
+avator_1:
+  preparation: False
+  bbox_shift: 0
+  video_path: "data/video/yongen.mp4"
+  audio_clips:
+    audio_0: "data/audio/eng.wav"
