@@ -18,5 +18,5 @@ imageio[ffmpeg]
 omegaconf
 ffmpeg-python
 moviepy
-piper-tts
+onnxruntime-gpu>=1.19.0
 soundfile

@@ -2,13 +2,15 @@
 # Start MuseTalk streaming web UI (default port 7860 — same as Gradio)
 set -e
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PYTHON="/home/administrator/miniconda3/envs/muse_talk/bin/python"
+PYTHON="/venv/muse_talk/bin/python"
 LOG="/tmp/stream_web_app.log"
 PIDFILE="/tmp/stream_web_app.pid"
 PORT="${PORT:-7860}"
 
 cd "$PROJECT_DIR"
-export PATH="/home/administrator/miniconda3/envs/muse_talk/bin:$PATH"
+export PATH="/venv/muse_talk/bin:$PATH"
+NVIDIA_LIB_DIRS="$(ls -d /venv/muse_talk/lib/python3.10/site-packages/nvidia/*/lib 2>/dev/null | paste -sd:)"
+export LD_LIBRARY_PATH="${NVIDIA_LIB_DIRS}:/venv/muse_talk/lib/python3.10/site-packages/torch/lib:${LD_LIBRARY_PATH:-}"
 
 for p in 7860 8080 8000; do fuser -k "${p}/tcp" 2>/dev/null || true; done
 sleep 1
@@ -17,9 +19,12 @@ nohup "$PYTHON" -m scripts.stream_web_app \
   --host 0.0.0.0 \
   --port "$PORT" \
   --fps 12 \
+  --progressive_mode piped \
+  --fmp4_frag_us 40000 \
+  --tts_gpu \
   --stream_batch_size 8 \
-  --stream_first_batch_size 8 \
-  --stream_emit_frames 4 \
+  --stream_first_batch_size 4 \
+  --stream_emit_frames 1 \
   --batch_size 32 \
   >> "$LOG" 2>&1 &
 echo $! > "$PIDFILE"

@@ -63,17 +63,22 @@ def _model_paths(voice_id: str, model_dir: str = DEFAULT_MODEL_DIR) -> Tuple[str
     )
 
 
-def get_tts_engine(voice: str = DEFAULT_VOICE, model_dir: str = DEFAULT_MODEL_DIR):
+def get_tts_engine(
+    voice: str = DEFAULT_VOICE,
+    model_dir: str = DEFAULT_MODEL_DIR,
+    use_cuda: bool = False,
+):
     voice_id = _resolve_voice_id(voice)
+    cache_key = (voice_id, model_dir, bool(use_cuda))
     with _ENGINE_LOCK:
-        cached = _ENGINE.get((voice_id, model_dir))
+        cached = _ENGINE.get(cache_key)
         if cached is not None:
             return cached
         from piper import PiperVoice
 
         model_path, config_path = _model_paths(voice_id, model_dir)
-        engine = PiperVoice.load(model_path, config_path=config_path)
-        _ENGINE[voice_id, model_dir] = engine
+        engine = PiperVoice.load(model_path, config_path=config_path, use_cuda=use_cuda)
+        _ENGINE[cache_key] = engine
         return engine
 
 
@@ -153,13 +158,14 @@ def synthesize_chunk_to_wav(
     output_path: str,
     voice: str = DEFAULT_VOICE,
     model_dir: str = DEFAULT_MODEL_DIR,
+    use_cuda: bool = False,
 ) -> Tuple[int, int]:
     """Synthesize one chunk to WAV. Returns (sample_rate, num_samples)."""
     text = (text or "").strip()
     if not text:
         raise ValueError("TTS chunk text is empty.")
 
-    engine = get_tts_engine(voice, model_dir)
+    engine = get_tts_engine(voice, model_dir, use_cuda=use_cuda)
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     with wave.open(output_path, "wb") as wav_file:
         engine.synthesize_wav(text, wav_file)
@@ -192,14 +198,22 @@ def resample_wav_for_whisper(src_wav: str, dst_wav: str, sample_rate: int = WHIS
     sf.write(dst_wav, audio, sample_rate)
 
 
-def synthesize_speech(text: str, output_path: str, voice: str = DEFAULT_VOICE, model_dir: str = DEFAULT_MODEL_DIR):
+def synthesize_speech(
+    text: str,
+    output_path: str,
+    voice: str = DEFAULT_VOICE,
+    model_dir: str = DEFAULT_MODEL_DIR,
+    use_cuda: bool = False,
+):
     """Full-text offline synthesis (non-streaming fallback)."""
     chunks = chunk_text_for_streaming(text, first_max_chars=10_000, max_chars=10_000)
     if not chunks:
         raise ValueError("TTS text is empty.")
 
     if len(chunks) == 1:
-        synthesize_chunk_to_wav(chunks[0], output_path, voice=voice, model_dir=model_dir)
+        synthesize_chunk_to_wav(
+            chunks[0], output_path, voice=voice, model_dir=model_dir, use_cuda=use_cuda
+        )
         return
 
     tmp_paths: List[str] = []
@@ -207,7 +221,9 @@ def synthesize_speech(text: str, output_path: str, voice: str = DEFAULT_VOICE, m
         base, ext = os.path.splitext(output_path)
         for idx, chunk in enumerate(chunks):
             chunk_path = f"{base}.part{idx:03d}{ext or '.wav'}"
-            synthesize_chunk_to_wav(chunk, chunk_path, voice=voice, model_dir=model_dir)
+            synthesize_chunk_to_wav(
+                chunk, chunk_path, voice=voice, model_dir=model_dir, use_cuda=use_cuda
+            )
             tmp_paths.append(chunk_path)
         concat_wavs(tmp_paths, output_path)
     finally:

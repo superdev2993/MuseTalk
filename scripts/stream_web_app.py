@@ -47,6 +47,7 @@ from musetalk.utils.tts import (
     wav_to_pcm_s16le,
 )
 from musetalk.utils.utils import load_all_model
+from musetalk.utils.audio_utils import ensure_wav
 from scripts.realtime_inference import Avatar, fast_check_ffmpeg
 
 UPLOAD_ROOT = "./results/stream_web/uploads"
@@ -198,10 +199,12 @@ INDEX_HTML = """<!DOCTYPE html>
     let player = document.getElementById('player');
     const placeholder = document.getElementById('placeholder');
     let pollTimer = null;
+    let pollSlowTimer = null;
     let previewToken = 0;
     let avStarted = false;
     let activeJobId = null;
     let pendingNewJob = false;
+    let terminalJobHandled = null;
     let msePlayer = null;
     let activeStreamUrl = null;
     let streamSession = 0;
@@ -237,12 +240,19 @@ INDEX_HTML = """<!DOCTYPE html>
       return player;
     }
 
+    function stopPreview() {
+      previewToken += 1;
+      previewImg.removeAttribute('src');
+      previewImg.style.display = 'none';
+    }
+
     function startPreview() {
       previewToken += 1;
+      const token = previewToken;
       placeholder.style.display = 'none';
       player.style.display = 'none';
       previewImg.style.display = 'block';
-      previewImg.src = '/stream?t=' + previewToken;
+      previewImg.src = '/stream?t=' + token;
     }
 
     function boxType(box) {
@@ -353,6 +363,9 @@ INDEX_HTML = """<!DOCTYPE html>
         }
 
         if (this.initDone && boxType(this.queue[0]) === 'moof') {
+          if (this.queue.length >= 2 && boxType(this.queue[1]) === 'mdat') {
+            this.appendOne(concatBoxes([this.queue.shift(), this.queue.shift()]));
+          }
           return;
         }
 
@@ -523,7 +536,8 @@ INDEX_HTML = """<!DOCTYPE html>
 
       const videoEl = replaceVideoElement();
       videoEl.style.display = 'block';
-      videoEl.muted = true;
+      // Submit click counts as user gesture — allow audio during live fMP4 playback.
+      videoEl.muted = false;
 
       msePlayer = new MSEStreamPlayer(videoEl, data.stream_url, sessionId);
       msePlayer.start();
@@ -532,9 +546,8 @@ INDEX_HTML = """<!DOCTYPE html>
         if (sessionId !== streamSession) return;
         avStarted = true;
         previewImg.style.display = 'none';
-        if (videoEl.muted) {
-          setStatus('Streaming — click the speaker icon to unmute.');
-        }
+        videoEl.muted = false;
+        videoEl.volume = 1.0;
       }, { once: true });
     }
 
@@ -582,10 +595,10 @@ INDEX_HTML = """<!DOCTYPE html>
       pendingNewJob = true;
       avStarted = false;
       activeJobId = null;
+      terminalJobHandled = null;
       stopMSEPlayer();
+      stopPreview();
       streamSession += 1;
-      previewImg.style.display = 'none';
-      previewImg.removeAttribute('src');
       placeholder.style.display = 'flex';
       try {
         player.pause();
@@ -593,6 +606,25 @@ INDEX_HTML = """<!DOCTYPE html>
         player.load();
         player.style.display = 'none';
       } catch (_) {}
+    }
+
+    function beginFastPolling() {
+      if (pollTimer) clearInterval(pollTimer);
+      pollTimer = setInterval(pollStatus, 150);
+      if (pollSlowTimer) {
+        clearInterval(pollSlowTimer);
+        pollSlowTimer = null;
+      }
+    }
+
+    function beginSlowPolling() {
+      if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+      if (!pollSlowTimer) {
+        pollSlowTimer = setInterval(pollStatus, 2000);
+      }
     }
 
     async function pollStatus() {
@@ -611,6 +643,10 @@ INDEX_HTML = """<!DOCTYPE html>
 
         if (pendingNewJob) {
           setStatus(msg);
+          return;
+        }
+
+        if (activeJobId && data.job_id && data.job_id !== activeJobId) {
           return;
         }
 
@@ -638,25 +674,34 @@ INDEX_HTML = """<!DOCTYPE html>
         }
 
         if (['uploading', 'preparing'].includes(data.state) && data.job_id === activeJobId) {
+          if (data.stream_url) startProgressiveMP4(data);
           if (previewImg.style.display === 'none' && player.style.display === 'none') startPreview();
           else previewImg.style.display = 'block';
         }
 
-        if (data.state === 'done' && data.job_id && data.job_id === activeJobId) {
+        if (data.state === 'done' && data.job_id === activeJobId) {
+          beginSlowPolling();
+          if (terminalJobHandled === data.job_id) {
+            if (hasPlayableBuffer(player)) {
+              setStatus((data.message || 'Stream complete.') + ' — progressive MP4 finished.');
+            }
+            return;
+          }
+          terminalJobHandled = data.job_id;
           if (hasPlayableBuffer(player)) {
             setStatus((data.message || 'Stream complete.') + ' — progressive MP4 finished.');
-          } else if (data.stream_url) {
-            startProgressiveMP4(data);
-            setTimeout(() => {
-              if (!hasPlayableBuffer(player) && data.result_url) playResultVideo(data, true);
-            }, 2500);
           } else if (data.result_url) {
             playResultVideo(data, true);
+          } else if (data.stream_url) {
+            startProgressiveMP4(data);
           }
         }
 
         if (['idle', 'done', 'error', 'cancelled'].includes(data.state)) {
           submitBtn.disabled = false;
+          if (['idle', 'error', 'cancelled'].includes(data.state)) {
+            beginSlowPolling();
+          }
         }
       } catch (err) {
         setStatus('Server connection failed: ' + err.message);
@@ -744,9 +789,9 @@ INDEX_HTML = """<!DOCTYPE html>
         if (!res.ok) throw new Error(data.error || 'Upload failed');
         activeJobId = data.job_id;
         pendingNewJob = false;
+        terminalJobHandled = null;
         setStatus(data.message || 'Processing started');
-        if (pollTimer) clearInterval(pollTimer);
-        pollTimer = setInterval(pollStatus, 400);
+        beginFastPolling();
         pollStatus();
       } catch (err) {
         setStatus('Error: ' + err.message);
@@ -756,7 +801,7 @@ INDEX_HTML = """<!DOCTYPE html>
     });
 
     pollStatus();
-    setInterval(pollStatus, 2000);
+    beginSlowPolling();
   </script>
 </body>
 </html>
@@ -933,7 +978,7 @@ class ProgressiveMP4Buffer:
         while True:
             with self._cond:
                 while idx >= len(self._chunks) and not self._closed:
-                    self._cond.wait(timeout=1.0)
+                    self._cond.wait(timeout=0.05)
                 if idx >= len(self._chunks):
                     if self._closed:
                         break
@@ -1009,10 +1054,10 @@ def probe_ffmpeg_nvenc() -> bool:
         return False
 
 
-def ffmpeg_h264_encoder_args(fps: int, use_gpu: bool | None = None) -> list:
+def ffmpeg_h264_encoder_args(fps: int, use_gpu: bool | None = None, low_latency: bool = False) -> list:
     """Return FFmpeg video encoder arguments (NVENC on GPU when available)."""
     gpu = USE_FFMPEG_GPU if use_gpu is None else use_gpu
-    gop = str(max(1, fps // 2))
+    gop = "1" if low_latency else str(max(1, fps // 2))
     if gpu:
         return [
             "-c:v",
@@ -1028,7 +1073,7 @@ def ffmpeg_h264_encoder_args(fps: int, use_gpu: bool | None = None) -> list:
             "-pix_fmt",
             "yuv420p",
         ]
-    return [
+    cpu_args = [
         "-c:v",
         "libx264",
         "-preset",
@@ -1042,6 +1087,9 @@ def ffmpeg_h264_encoder_args(fps: int, use_gpu: bool | None = None) -> list:
         "-pix_fmt",
         "yuv420p",
     ]
+    if low_latency:
+        cpu_args.extend(["-x264-params", "keyint=1:min-keyint=1:scenecut=0"])
+    return cpu_args
 
 
 def load_cache_index():
@@ -1124,7 +1172,7 @@ class FFmpegProgressiveStreamer:
             "0:v:0",
             "-map",
             "1:a:0",
-            *ffmpeg_h264_encoder_args(self.fps, use_gpu=self.use_gpu),
+            *ffmpeg_h264_encoder_args(self.fps, use_gpu=self.use_gpu, low_latency=True),
             "-profile:v",
             "baseline",
             "-level",
@@ -1132,7 +1180,7 @@ class FFmpegProgressiveStreamer:
             "-c:a",
             "aac",
             "-b:a",
-            "128k",
+            "96k",
             "-shortest",
         ]
         if self.ts_offset > 0:
@@ -1144,6 +1192,8 @@ class FFmpegProgressiveStreamer:
             movflags += "+frag_discont"
         cmd.extend(
             [
+            "-flush_packets",
+            "1",
             "-f",
             "mp4",
             "-movflags",
@@ -1170,7 +1220,7 @@ class FFmpegProgressiveStreamer:
     def _read_stdout(self):
         try:
             while True:
-                chunk = self._proc.stdout.read(65536)
+                chunk = self._proc.stdout.read(16384)
                 if not chunk:
                     break
                 self.buffer.append(chunk)
@@ -1311,12 +1361,14 @@ class PipedFFmpegMuxer:
         buffer: ProgressiveMP4Buffer,
         output_path: str,
         use_gpu: bool = False,
+        frag_duration_us: int = 40000,
     ):
         self.fps = fps
         self.sample_rate = sample_rate
         self.buffer = buffer
         self.output_path = output_path
         self.use_gpu = use_gpu
+        self.frag_duration_us = frag_duration_us
         self._audio_writer = None
         self._video_writer = None
         self._proc = None
@@ -1343,8 +1395,10 @@ class PipedFFmpegMuxer:
             "-y",
             "-loglevel",
             "error",
+            "-fflags",
+            "nobuffer",
             "-thread_queue_size",
-            "1024",
+            "512",
             "-f",
             "rawvideo",
             "-pix_fmt",
@@ -1356,7 +1410,7 @@ class PipedFFmpegMuxer:
             "-i",
             "pipe:0",
             "-thread_queue_size",
-            "1024",
+            "512",
             "-f",
             "s16le",
             "-ar",
@@ -1369,19 +1423,25 @@ class PipedFFmpegMuxer:
             "0:v:0",
             "-map",
             "1:a:0",
-            *ffmpeg_h264_encoder_args(self.fps, use_gpu=self.use_gpu),
+            *ffmpeg_h264_encoder_args(self.fps, use_gpu=self.use_gpu, low_latency=True),
+            "-profile:v",
+            "baseline",
+            "-level",
+            "3.1",
             "-c:a",
             "aac",
             "-b:a",
-            "128k",
+            "96k",
             "-max_muxing_queue_size",
-            "1024",
+            "512",
+            "-flush_packets",
+            "1",
             "-f",
             "mp4",
             "-movflags",
             "frag_keyframe+empty_moov+default_base_moof",
             "-frag_duration",
-            "250000",
+            str(self.frag_duration_us),
             "pipe:1",
         ]
         self._proc = subprocess.Popen(
@@ -1403,7 +1463,7 @@ class PipedFFmpegMuxer:
     def _read_stdout(self):
         try:
             while True:
-                chunk = self._proc.stdout.read(65536)
+                chunk = self._proc.stdout.read(16384)
                 if not chunk:
                     break
                 self.buffer.append(chunk)
@@ -1669,6 +1729,8 @@ class StreamWebService:
 
     def set_status(self, state, message, cached=False, job_id=None, stream_url=None, result_url=None, audio_url=None):
         with self._lock:
+            if job_id is not None and self._current_job_id is not None and job_id != self._current_job_id:
+                return
             status = {"state": state, "message": message, "cached": cached, "stream_url": None, "result_url": None, "audio_url": None}
             if job_id is not None:
                 status["job_id"] = job_id
@@ -1690,6 +1752,12 @@ class StreamWebService:
         print(f"[{state}] {message}")
 
     def _reset_av_stream(self, job_id, audio_path=None, piped=False, upload_dir=None):
+        if self._mux_worker is not None:
+            try:
+                self._mux_worker.finish()
+            except Exception:
+                pass
+            self._mux_worker = None
         if self._av_encoder is not None:
             self._av_encoder.finish()
         self._av_encoder = None
@@ -1716,6 +1784,29 @@ class StreamWebService:
         if os.path.isfile(self._av_output_path):
             os.remove(self._av_output_path)
         self._mux_frames = False
+
+    def _stop_running_job(self):
+        self._cancel_event.set()
+        self._mux_frames = False
+        if self._mux_worker is not None:
+            try:
+                self._mux_worker.finish()
+            except Exception:
+                pass
+            self._mux_worker = None
+        if self._av_encoder is not None:
+            try:
+                self._av_encoder.finish()
+            except Exception:
+                pass
+            self._av_encoder = None
+        self._shutdown_segment_executor()
+        if self._worker is not None and self._worker.is_alive():
+            self._worker.join(timeout=8)
+        self._worker = None
+        with self._lock:
+            self._latest_frame = None
+        self._frame_event.clear()
 
     def _begin_av_mux(self):
         self._mux_frames = True
@@ -1821,7 +1912,7 @@ class StreamWebService:
             wav_path,
             chunk_buf,
             part_path,
-            use_gpu=False,
+            use_gpu=USE_FFMPEG_GPU,
             ts_offset=self._live_ts_offset,
             frag_discont=is_continuation,
         )
@@ -1926,7 +2017,8 @@ class StreamWebService:
                     self._tts_sample_rate,
                     self._mp4_buffer,
                     self._av_output_path,
-                    use_gpu=False,
+                    use_gpu=USE_FFMPEG_GPU,
+                    frag_duration_us=self.args.fmp4_frag_us,
                 )
             elif self._av_audio_path:
                 self._av_encoder = FFmpegProgressiveStreamer(
@@ -1939,7 +2031,7 @@ class StreamWebService:
             self._av_encoder.write_frame(frame_bgr)
 
     def _write_mux_audio(self, pcm_bytes: bytes):
-        if self._av_encoder is not None and pcm_bytes:
+        if self._av_encoder is not None and pcm_bytes and hasattr(self._av_encoder, "write_audio_pcm"):
             self._av_encoder.write_audio_pcm(pcm_bytes)
 
     def _load_wav_pcm(self, wav_path: str):
@@ -1983,7 +2075,7 @@ class StreamWebService:
             self._frame_archive.append(frame_bgr.copy())
             if self._piped_mux:
                 self._submit_piped_av_frame(frame_bgr)
-            if self._live_segment_mux:
+            elif self._live_segment_mux:
                 self._maybe_emit_live_segment()
             elif (
                 self._av_output_path
@@ -2064,9 +2156,11 @@ class StreamWebService:
             return video_path, None, True, preset_model, text_val, voice
         elif has_audio_file:
             audio_ext = os.path.splitext(audio_item.filename)[1] or ".wav"
-            audio_path = os.path.join(upload_dir, f"audio{audio_ext}")
-            with open(audio_path, "wb") as f:
+            raw_path = os.path.join(upload_dir, f"audio_upload{audio_ext}")
+            with open(raw_path, "wb") as f:
                 f.write(audio_item.file.read())
+            audio_path = ensure_wav(raw_path, os.path.join(upload_dir, "audio_16k.wav"))
+            print(f"Audio uploaded: {audio_item.filename} -> {audio_path} (16kHz mono)")
         else:
             raise ValueError("Provide text for TTS or upload an audio file.")
 
@@ -2133,7 +2227,8 @@ class StreamWebService:
         timer.mark("mux_started")
 
         chunk_wavs = []
-        prefetch = ThreadPoolExecutor(max_workers=1)
+        prefetch = ThreadPoolExecutor(max_workers=2)
+        use_cuda = self._tts_use_cuda()
 
         def synth_chunk(idx, chunk_text):
             raw_wav = os.path.join(upload_dir, f"chunk_{idx:03d}.wav")
@@ -2142,6 +2237,7 @@ class StreamWebService:
                 raw_wav,
                 voice=voice,
                 model_dir=self.args.piper_model_dir,
+                use_cuda=use_cuda,
             )
             return raw_wav, sr
 
@@ -2231,7 +2327,7 @@ class StreamWebService:
                 self._register_cache(video_hash, avatar_id, video_path)
 
             if self._cancel_event.is_set():
-                self.set_status("cancelled", "Job cancelled.", cached=use_cache)
+                self.set_status("cancelled", "Job cancelled.", cached=use_cache, job_id=job_id)
                 return
 
             stream_url = f"/api/progressive/{job_id}.mp4"
@@ -2265,7 +2361,10 @@ class StreamWebService:
                         audio_url=audio_url,
                     )
                 self._begin_av_mux()
-                if self._live_segment_mux and audio_path and os.path.isfile(audio_path):
+                if self._piped_mux and audio_path and os.path.isfile(audio_path):
+                    pcm_bytes, sample_rate = self._load_wav_pcm(audio_path)
+                    self._enqueue_chunk_audio(pcm_bytes, sample_rate)
+                elif self._live_segment_mux and audio_path and os.path.isfile(audio_path):
                     import soundfile as sf
 
                     info = sf.info(audio_path)
@@ -2289,7 +2388,7 @@ class StreamWebService:
                 timer.mark("mux_finalize_done")
 
             if self._cancel_event.is_set():
-                self.set_status("cancelled", "Job cancelled.", cached=use_cache)
+                self.set_status("cancelled", "Job cancelled.", cached=use_cache, job_id=job_id)
             else:
                 msg = "Stream complete. Upload again to try another clip."
                 self.set_status(
@@ -2302,19 +2401,30 @@ class StreamWebService:
                     audio_url=audio_url,
                 )
         except Exception as exc:
-            self.set_status("error", f"Processing error: {exc}", cached=use_cache)
-            self.push_status_frame("Error: " + str(exc)[:60])
+            err_msg = str(exc).strip() or f"{type(exc).__name__}"
+            self.set_status("error", f"Processing error: {err_msg}", cached=use_cache, job_id=job_id)
+            self.push_status_frame("Error: " + err_msg[:60])
             raise
         finally:
             rt.args.cancel_event = None
+
+    def _tts_use_cuda(self) -> bool:
+        if not self.args.tts_gpu:
+            return False
+        if not torch.cuda.is_available():
+            return False
+        try:
+            import onnxruntime as ort
+
+            return "CUDAExecutionProvider" in ort.get_available_providers()
+        except Exception:
+            return False
 
     def start_job(self, video_path, audio_path, job_id, text=None, voice=None, upload_dir=None, piped=False, live_segment=False):
         if not self._models_ready.is_set():
             raise RuntimeError("Models are still loading.")
 
-        if self._worker is not None and self._worker.is_alive():
-            self._cancel_event.set()
-            self._worker.join(timeout=3)
+        self._stop_running_job()
 
         avatar_id, need_preparation, video_hash = self._resolve_avatar(video_path)
         use_cache = not need_preparation
@@ -2324,9 +2434,6 @@ class StreamWebService:
 
         rt.args.cancel_event = self._cancel_event
 
-        with self._lock:
-            self._latest_frame = None
-        self._frame_event.clear()
         upload_dir = upload_dir or os.path.join(UPLOAD_ROOT, job_id)
         self._reset_av_stream(job_id, audio_path=audio_path, piped=piped, upload_dir=upload_dir)
         self._live_segment_mux = live_segment
@@ -2399,8 +2506,8 @@ class StreamWebService:
             text=text_val,
             voice=voice,
             upload_dir=upload_dir,
-            piped=False,
-            live_segment=True,
+            piped=self.args.progressive_mode == "piped",
+            live_segment=self.args.progressive_mode == "segment",
         )
 
         return {
@@ -2432,6 +2539,7 @@ class StreamWebService:
             handler.send_header("Content-Type", "video/mp4")
             handler.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
             handler.send_header("Pragma", "no-cache")
+            handler.send_header("X-Accel-Buffering", "no")
             if not send_body:
                 handler.end_headers()
                 return
@@ -2509,6 +2617,7 @@ class StreamWebService:
                     raw_wav,
                     voice=self.args.tts_voice,
                     model_dir=self.args.piper_model_dir,
+                    use_cuda=self._tts_use_cuda(),
                 )
                 resample_wav_for_whisper(raw_wav, whisper_wav)
                 avatar.inference(
@@ -2768,8 +2877,27 @@ def parse_args():
     parser.add_argument(
         "--stream_emit_frames",
         type=int,
-        default=2,
-        help="Emit progressive MP4 segment every N lip-sync frames during inference",
+        default=1,
+        help="Emit progressive MP4 segment every N lip-sync frames (segment mode only)",
+    )
+    parser.add_argument(
+        "--tts_gpu",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use GPU (ONNX CUDA) for local Piper TTS when available",
+    )
+    parser.add_argument(
+        "--progressive_mode",
+        type=str,
+        default="piped",
+        choices=["piped", "segment"],
+        help="piped: single FFmpeg fMP4 session (lowest latency); segment: batch mux per N frames",
+    )
+    parser.add_argument(
+        "--fmp4_frag_us",
+        type=int,
+        default=40000,
+        help="fMP4 fragment duration in microseconds for piped mode (lower = faster browser playback start)",
     )
     parser.add_argument("--tts_first_chunk_chars", type=int, default=18, help="Max chars in first TTS chunk for low latency")
     parser.add_argument("--tts_chunk_chars", type=int, default=96, help="Max chars per follow-up TTS chunk")
@@ -2811,6 +2939,11 @@ def main():
         print("FFmpeg GPU (h264_nvenc) unavailable — using libx264 on CPU for mux", flush=True)
     elif USE_FFMPEG_GPU:
         print("FFmpeg video encoding: h264_nvenc (GPU). Audio AAC remains on CPU.", flush=True)
+    print(
+        f"Progressive MP4 mode: {args.progressive_mode} "
+        f"(fMP4 frag={args.fmp4_frag_us}us, emit_every={args.stream_emit_frames} frames in segment mode)",
+        flush=True,
+    )
 
     service = StreamWebService(args)
     service.set_status("loading", "Loading models... please wait.")
@@ -2822,14 +2955,16 @@ def main():
         service._models_ready.set()
         try:
             service.set_status("loading", "Loading local Piper TTS...")
-            engine = get_tts_engine(args.tts_voice, args.piper_model_dir)
+            use_cuda = service._tts_use_cuda()
+            engine = get_tts_engine(args.tts_voice, args.piper_model_dir, use_cuda=use_cuda)
             import tempfile
             import wave
 
             with tempfile.NamedTemporaryFile(suffix=".wav") as tmp:
                 with wave.open(tmp.name, "wb") as wf:
                     engine.synthesize_wav("Hi.", wf)
-            print("Local Piper TTS ready")
+            mode = "GPU (ONNX CUDA)" if use_cuda else "CPU"
+            print(f"Local Piper TTS ready ({mode})")
         except Exception as exc:
             print(f"Warning: Piper TTS preload failed: {exc}")
         if args.preload_presets:

@@ -3,8 +3,10 @@
 set -e
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PYTHON="/home/administrator/miniconda3/envs/muse_talk/bin/python"
-export PATH="/home/administrator/miniconda3/envs/muse_talk/bin:$PATH"
+PYTHON="/venv/muse_talk/bin/python"
+export PATH="/venv/muse_talk/bin:$PATH"
+NVIDIA_LIB_DIRS="$(ls -d /venv/muse_talk/lib/python3.10/site-packages/nvidia/*/lib 2>/dev/null | paste -sd:)"
+export LD_LIBRARY_PATH="${NVIDIA_LIB_DIRS}:/venv/muse_talk/lib/python3.10/site-packages/torch/lib:${LD_LIBRARY_PATH:-}"
 
 cd "$PROJECT_DIR"
 
@@ -61,6 +63,9 @@ case "${1:-}" in
       --unet_config models/musetalkV15/musetalk.json \
       --version v15 \
       --fps 25 \
+      --progressive_mode piped \
+      --fmp4_frag_us 40000 \
+      --stream_first_batch_size 4 \
       --host 0.0.0.0 \
       --port 7860
     ;;
