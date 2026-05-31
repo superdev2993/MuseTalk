@@ -90,6 +90,15 @@ class Avatar:
         self.idx = 0
         self.init()
 
+    def has_cached_material(self):
+        required = [
+            self.latents_out_path,
+            self.coords_path,
+            self.mask_coords_path,
+            self.avatar_info_path,
+        ]
+        return all(os.path.exists(p) for p in required)
+
     def load_cached_material(self):
         self.input_latent_list_cycle = torch.load(self.latents_out_path)
         with open(self.coords_path, 'rb') as f:
@@ -107,8 +116,17 @@ class Avatar:
         if self.preparation:
             if os.path.exists(self.avatar_path):
                 if self.non_interactive:
-                    print(f"{self.avatar_id} exists, loading cached avatar materials.")
-                    self.load_cached_material()
+                    if self.has_cached_material():
+                        print(f"{self.avatar_id} exists, loading cached avatar materials.")
+                        self.load_cached_material()
+                    else:
+                        print(f"{self.avatar_id} incomplete cache detected, recreating avatar.")
+                        shutil.rmtree(self.avatar_path)
+                        print("*********************************")
+                        print(f"  creating avator: {self.avatar_id}")
+                        print("*********************************")
+                        osmakedirs([self.avatar_path, self.full_imgs_path, self.video_out_path, self.mask_out_path])
+                        self.prepare_material()
                 else:
                     response = input(f"{self.avatar_id} exists, Do you want to re-create it ? (y/n)")
                     if response.lower() == "y":
@@ -127,9 +145,16 @@ class Avatar:
                 osmakedirs([self.avatar_path, self.full_imgs_path, self.video_out_path, self.mask_out_path])
                 self.prepare_material()
         else:
-            if not os.path.exists(self.avatar_path):
-                print(f"{self.avatar_id} does not exist, you should set preparation to True")
-                sys.exit()
+            if not os.path.exists(self.avatar_path) or not self.has_cached_material():
+                if os.path.exists(self.avatar_path):
+                    print(f"{self.avatar_id} cache incomplete, recreating avatar.")
+                    shutil.rmtree(self.avatar_path)
+                print("*********************************")
+                print(f"  creating avator: {self.avatar_id}")
+                print("*********************************")
+                osmakedirs([self.avatar_path, self.full_imgs_path, self.video_out_path, self.mask_out_path])
+                self.prepare_material()
+                return
 
             with open(self.avatar_info_path, "r") as f:
                 avatar_info = json.load(f)
