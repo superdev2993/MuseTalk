@@ -347,11 +347,11 @@ class Avatar:
                 encoder_hidden_states=audio_feature_batch,
             ).sample
             pred_latents = pred_latents.to(device=device, dtype=vae.vae.dtype)
-            recon = vae.decode_latents(pred_latents)
-            for res_frame in recon:
-                res_frame_queue.put(res_frame)
+            for i in range(pred_latents.shape[0]):
+                for res_frame in vae.decode_latents(pred_latents[i : i + 1]):
+                    res_frame_queue.put(res_frame)
         res_frame_queue.put(None)
-        process_thread.join(timeout=120)
+        process_thread.join(timeout=max(300, video_num))
         if process_thread.is_alive():
             print(f"WARNING: process_frames thread did not finish within 120s (video_num={video_num}, idx={self.idx})")
 

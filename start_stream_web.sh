@@ -21,9 +21,9 @@ nohup "$PYTHON" -m scripts.stream_web_app \
   --fps 12 \
   --progressive_mode piped \
   --stream_first_batch_size 1 \
-  --stream_batch_size 16 \
+  --stream_batch_size 24 \
   --stream_ramp_batch_size 4 \
-  --stream_ramp_batches 8 \
+  --stream_ramp_batches 4 \
   --fmp4_frag_us 0 \
   --tts_gpu \
   --tts_prefetch_workers 4 \

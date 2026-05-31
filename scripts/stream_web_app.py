@@ -492,6 +492,7 @@ INDEX_HTML = """<!DOCTYPE html>
         this._sourceOpenHandler = null;
         this.framer = null;
         this._waitingForData = false;
+        this._playStarted = false;
       }
 
       isStale() {
@@ -525,6 +526,8 @@ INDEX_HTML = """<!DOCTYPE html>
         this.mediaSource = null;
         this.queue = [];
         this.appending = false;
+        this._playStarted = false;
+        this._waitingForData = false;
       }
 
       start() {
@@ -566,10 +569,17 @@ INDEX_HTML = """<!DOCTYPE html>
           if (!this.sourceBuffer.buffered.length) return;
           const end = this.sourceBuffer.buffered.end(this.sourceBuffer.buffered.length - 1);
           const ahead = end - this.video.currentTime;
-          const minBuffer = this._waitingForData ? 2.0 : 4.0;
-          if ((this.video.paused || this._waitingForData) && ahead >= minBuffer) {
+          if (this._waitingForData) {
+            if (ahead >= 1.0) {
+              this.video.play().then(() => {
+                this._waitingForData = false;
+              }).catch(() => {});
+            }
+            return;
+          }
+          if (!this._playStarted && ahead >= 0.45) {
             this.video.play().then(() => {
-              this._waitingForData = false;
+              this._playStarted = true;
             }).catch(() => {
               if (!this.isStale()) setStatus('Streaming — click Play on the video player.');
             });
@@ -1007,9 +1017,9 @@ def autotune_batch_sizes(args, device):
     args.stream_ramp_batch_size = max(2, min(ramp, args.stream_batch_size))
     args.stream_ramp_batches = max(2, getattr(args, "stream_ramp_batches", 4))
     if getattr(args, "progressive_mode", "piped") == "piped":
-        args.stream_batch_size = min(args.stream_batch_size, 16)
+        args.stream_batch_size = min(args.stream_batch_size, 24)
         args.stream_ramp_batch_size = min(args.stream_ramp_batch_size, 4)
-        args.stream_ramp_batches = max(args.stream_ramp_batches, 6)
+        args.stream_ramp_batches = max(args.stream_ramp_batches, 4)
     print(
         f"VRAM {gb_free:.1f}GB free / {gb_total:.1f}GB total — "
         f"stream_batch={args.stream_batch_size}, first_batch={args.stream_first_batch_size}, "
@@ -1662,7 +1672,7 @@ class PipedFFmpegMuxer:
     def _read_stdout(self):
         try:
             while True:
-                chunk = self._proc.stdout.read(16384)
+                chunk = self._proc.stdout.read(4096)
                 if not chunk:
                     break
                 self.buffer.append(chunk)
@@ -1728,10 +1738,9 @@ class PipedFFmpegMuxer:
 
 
 class MuxWorker:
-    """Feed FFmpeg immediately; throttle only when many seconds of frames are queued."""
+    """Pass A/V pairs to FFmpeg immediately (build browser buffer ahead of playback)."""
 
     _SENTINEL = ("__stop__", None)
-    HIGH_WATER_SEC = 10.0
 
     def __init__(self, service: "StreamWebService"):
         self.service = service
@@ -1743,16 +1752,10 @@ class MuxWorker:
         self._queue.put(("pair", frame_bgr.copy(), pcm_bytes))
 
     def finish(self):
-        self._drain_fast = True
         self._queue.put(self._SENTINEL)
         self._thread.join(timeout=900)
 
     def _run(self):
-        fps = max(1, self.service.args.fps)
-        interval = 1.0 / fps
-        wall_start = None
-        emitted = 0
-        self._drain_fast = False
         while True:
             item = self._queue.get()
             if item == self._SENTINEL:
@@ -1760,19 +1763,8 @@ class MuxWorker:
             try:
                 if item[0] == "pair":
                     _, frame, pcm = item
-                    ahead_sec = self._queue.qsize() / fps
-                    if not self._drain_fast and ahead_sec >= self.HIGH_WATER_SEC:
-                        if wall_start is None:
-                            wall_start = time.monotonic()
-                        target = wall_start + emitted * interval
-                        delay = target - time.monotonic()
-                        if delay > 0:
-                            time.sleep(delay)
-                    else:
-                        wall_start = None
                     self.service._write_mux_frame(frame)
                     self.service._write_mux_audio(pcm)
-                    emitted += 1
             except Exception as exc:
                 print(f"[mux-worker] pair error: {exc}", flush=True)
         if self.service._av_encoder is not None:
@@ -2018,6 +2010,8 @@ class StreamWebService:
         self._tts_sample_rate = 22050
         self._audio_byte_queue = bytearray()
         self._audio_bytes_per_frame = None
+        self._chunk_pcm_buf = bytearray()
+        self._use_chunk_pcm = False
         self._frame_archive = []
         self._av_output_path = os.path.join(UPLOAD_ROOT, job_id, "output.mp4")
         self._progressive_path = progressive_mp4_path(job_id)
@@ -2332,6 +2326,26 @@ class StreamWebService:
             self._audio_bytes_per_frame = bpf
         self._audio_byte_queue.extend(pcm_bytes)
 
+    def _set_chunk_pcm(self, pcm_bytes: bytes, sample_rate: int):
+        """Bind the next lip-sync frames to this TTS chunk's PCM (avoids cross-chunk A/V drift)."""
+        bpf = max(2, int(round(sample_rate / self.args.fps) * 2))
+        self._tts_sample_rate = sample_rate
+        self._audio_bytes_per_frame = bpf
+        self._chunk_pcm_buf = bytearray(pcm_bytes)
+        self._use_chunk_pcm = True
+
+    def _take_chunk_pcm(self) -> bytes:
+        n = self._audio_bytes_per_frame
+        if len(self._chunk_pcm_buf) >= n:
+            pcm = bytes(self._chunk_pcm_buf[:n])
+            del self._chunk_pcm_buf[:n]
+            return pcm
+        if self._chunk_pcm_buf:
+            pcm = bytes(self._chunk_pcm_buf)
+            self._chunk_pcm_buf.clear()
+            return pcm + b"\x00" * (n - len(pcm))
+        return b"\x00" * n
+
     def _take_paced_pcm(self) -> bytes:
         n = self._audio_bytes_per_frame
         if len(self._audio_byte_queue) >= n:
@@ -2349,7 +2363,11 @@ class StreamWebService:
             return
         if self._mux_worker is None:
             self._mux_worker = MuxWorker(self)
-        self._mux_worker.submit_av_pair(frame_bgr, self._take_paced_pcm())
+        if self._use_chunk_pcm:
+            pcm = self._take_chunk_pcm()
+        else:
+            pcm = self._take_paced_pcm()
+        self._mux_worker.submit_av_pair(frame_bgr, pcm)
 
     def push_frame(self, frame_bgr: np.ndarray, preview_only: bool = False):
         """Store a BGR frame for MJPEG preview and optionally mux into progressive MP4."""
@@ -2570,7 +2588,7 @@ class StreamWebService:
                 chunk_wavs.append(raw_wav)
 
                 if self._piped_mux:
-                    self._enqueue_chunk_audio(prepared["pcm_bytes"], prepared["pcm_sr"])
+                    self._set_chunk_pcm(prepared["pcm_bytes"], prepared["pcm_sr"])
                 if self._live_segment_mux:
                     self._prepare_chunk_stream(raw_wav, sample_rate, frame_idx_before)
 
@@ -3440,7 +3458,7 @@ def parse_args():
         "--fmp4_frag_us",
         type=int,
         default=0,
-        help="fMP4 fragment duration in microseconds (0 = one second of video at --fps)",
+        help="fMP4 fragment duration in microseconds (0 = one video frame at --fps, fastest start)",
     )
     parser.add_argument("--tts_first_chunk_chars", type=int, default=18, help="Max chars in first TTS chunk for low latency")
     parser.add_argument("--tts_chunk_chars", type=int, default=96, help="Max chars per follow-up TTS chunk")
@@ -3484,6 +3502,7 @@ def main():
     args.preload_presets = preload_list
 
     if args.fmp4_frag_us <= 0:
+        # One video frame per fragment — fastest first MSE append.
         args.fmp4_frag_us = max(10000, 1_000_000 // max(1, args.fps))
 
     device = torch.device(f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu")

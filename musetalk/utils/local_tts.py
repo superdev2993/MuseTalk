@@ -30,6 +30,7 @@ DEFAULT_MODEL_DIR = "./models/piper"
 WHISPER_SAMPLE_RATE = 16000
 
 _ENGINE_LOCK = threading.Lock()
+_TTS_SYNTH_LOCK = threading.Lock()
 _ENGINE: dict = {}
 
 
@@ -167,8 +168,9 @@ def synthesize_chunk_to_wav(
 
     engine = get_tts_engine(voice, model_dir, use_cuda=use_cuda)
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    with wave.open(output_path, "wb") as wav_file:
-        engine.synthesize_wav(text, wav_file)
+    with _TTS_SYNTH_LOCK:
+        with wave.open(output_path, "wb") as wav_file:
+            engine.synthesize_wav(text, wav_file)
 
     with wave.open(output_path, "rb") as wav_file:
         sample_rate = wav_file.getframerate()
