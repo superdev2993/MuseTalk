@@ -267,6 +267,7 @@ class Avatar:
         stream_fps=None,
         batch_size=None,
         first_batch_size=None,
+        whisper_chunks=None,
     ):
         os.makedirs(self.avatar_path + '/tmp', exist_ok=True)
         print("start inference")
@@ -274,18 +275,21 @@ class Avatar:
         effective_first_batch_size = first_batch_size if first_batch_size is not None else effective_batch_size
         ############################################## extract audio feature ##############################################
         start_time = time.time()
-        whisper_input_features, librosa_length = audio_processor.get_audio_feature(audio_path, weight_dtype=weight_dtype)
-        whisper_chunks = audio_processor.get_whisper_chunk(
-            whisper_input_features,
-            device,
-            weight_dtype,
-            whisper,
-            librosa_length,
-            fps=fps,
-            audio_padding_length_left=args.audio_padding_length_left,
-            audio_padding_length_right=args.audio_padding_length_right,
-        )
-        print(f"processing audio:{audio_path} costs {(time.time() - start_time) * 1000}ms")
+        if whisper_chunks is None:
+            whisper_input_features, librosa_length = audio_processor.get_audio_feature(audio_path, weight_dtype=weight_dtype)
+            whisper_chunks = audio_processor.get_whisper_chunk(
+                whisper_input_features,
+                device,
+                weight_dtype,
+                whisper,
+                librosa_length,
+                fps=fps,
+                audio_padding_length_left=args.audio_padding_length_left,
+                audio_padding_length_right=args.audio_padding_length_right,
+            )
+            print(f"processing audio:{audio_path} costs {(time.time() - start_time) * 1000}ms")
+        else:
+            print(f"using pre-warmed whisper chunks ({whisper_chunks.shape[0]} frames)")
         ############################################## inference batch by batch ##############################################
         video_num = len(whisper_chunks)
         if video_num == 0:
@@ -314,6 +318,11 @@ class Avatar:
             take = min(take, remaining)
             remaining -= take
             expected_batches += 1
+
+        if frame_sink is not None and hasattr(frame_sink, "mark_inference_start"):
+            job_id = getattr(frame_sink, "_current_job_id", None)
+            if job_id:
+                frame_sink.mark_inference_start(job_id)
 
         for whisper_batch, latent_batch in tqdm(gen, total=expected_batches):
             if _is_cancelled():

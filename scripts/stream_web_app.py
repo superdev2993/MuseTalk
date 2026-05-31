@@ -110,7 +110,13 @@ INDEX_HTML = """<!DOCTYPE html>
     .input-panel.active { display: block; }
     button { margin-top: 16px; background: #3b82f6; color: white; border: 0; border-radius: 8px; padding: 12px 18px; font-size: 1rem; cursor: pointer; }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button.btn-secondary { background: #334155; margin-top: 0; padding: 8px 14px; font-size: 0.95rem; white-space: nowrap; }
+    button.btn-secondary:not(:disabled):hover { background: #475569; }
+    .audio-row { display: flex; gap: 10px; align-items: center; margin-top: 6px; }
+    .audio-row input[type=file] { flex: 1; margin: 0; }
+    .audio-upload-ok { color: #86efac; }
     #status { min-height: 1.4em; color: #93c5fd; margin-top: 12px; white-space: pre-wrap; }
+    #timing-info { color: #86efac; font-size: 1rem; margin-top: 8px; min-height: 1.2em; }
     .hint { color: #64748b; font-size: 0.9rem; margin-top: 8px; }
     .stream-wrap { background: #000; border-radius: 12px; overflow: hidden; min-height: 360px; display: flex; align-items: center; justify-content: center; position: relative; }
     #preview { width: 100%; display: block; background: #000; min-height: 360px; object-fit: contain; }
@@ -174,11 +180,16 @@ INDEX_HTML = """<!DOCTYPE html>
 
         <div id="panel-audio" class="input-panel">
           <label for="audio">Driving audio (wav, mp3, etc.)</label>
-          <input id="audio" name="audio" type="file" accept="audio/*">
+          <div class="audio-row">
+            <input id="audio" name="audio" type="file" accept="audio/*">
+            <button type="button" id="audio-upload-btn" class="btn-secondary" style="display:none" disabled>Upload</button>
+          </div>
+          <div id="audio-upload-status" class="hint">Select a file, click Upload, then Start streaming.</div>
         </div>
 
         <button id="submit-btn" type="submit">Start streaming</button>
         <div id="status">Connecting to server...</div>
+        <div id="timing-info"></div>
         <div id="conn-hint" class="hint"></div>
         <div class="hint">Local offline TTS · Step timings in server log and status · MJPEG preview while generating</div>
       </form>
@@ -194,8 +205,12 @@ INDEX_HTML = """<!DOCTYPE html>
   <script>
     const form = document.getElementById('upload-form');
     const statusEl = document.getElementById('status');
+    const timingEl = document.getElementById('timing-info');
     const connHint = document.getElementById('conn-hint');
     const submitBtn = document.getElementById('submit-btn');
+    const audioInput = document.getElementById('audio');
+    const audioUploadBtn = document.getElementById('audio-upload-btn');
+    const audioUploadStatus = document.getElementById('audio-upload-status');
     const previewImg = document.getElementById('preview');
     let player = document.getElementById('player');
     const placeholder = document.getElementById('placeholder');
@@ -209,9 +224,97 @@ INDEX_HTML = """<!DOCTYPE html>
     let msePlayer = null;
     let activeStreamUrl = null;
     let streamSession = 0;
+    let jobStartMs = null;
+    let clientDisplayMs = null;
+    let inputMode = 'text';
+    let videoMode = 'preset';
+    let selectedPreset = 'model1';
+    let audioUploaded = false;
+    let audioWarmupReady = false;
+    let audioToken = null;
+    let audioUploadBusy = false;
+    let serverBusy = false;
 
     function setStatus(text) {
       statusEl.textContent = text;
+    }
+
+    function updateTimingDisplay(data) {
+      if (!timingEl) return;
+      const parts = [];
+      if (data && data.first_frame_ms != null) {
+        parts.push('Inference→frame (UNet start): ' + data.first_frame_ms + ' ms');
+      } else if (data && data.inference_elapsed_ms != null) {
+        parts.push('Running inference... ' + data.inference_elapsed_ms + ' ms');
+      }
+      if (clientDisplayMs != null) {
+        parts.push('Start→browser play: ' + clientDisplayMs + ' ms');
+      }
+      timingEl.textContent = parts.join('  |  ');
+    }
+
+    function resetTimingDisplay() {
+      jobStartMs = null;
+      clientDisplayMs = null;
+      if (timingEl) timingEl.textContent = '';
+    }
+
+    function markClientFirstFrame() {
+      if (jobStartMs != null && clientDisplayMs == null) {
+        clientDisplayMs = Math.round(Date.now() - jobStartMs);
+      }
+    }
+
+    function updateSubmitEnabled() {
+      if (serverBusy || audioUploadBusy) {
+        submitBtn.disabled = true;
+        return;
+      }
+      if (inputMode === 'audio') {
+        submitBtn.disabled = !audioUploaded || !audioWarmupReady;
+      } else {
+        submitBtn.disabled = false;
+      }
+    }
+
+    function resetAudioUpload() {
+      audioUploaded = false;
+      audioWarmupReady = false;
+      audioToken = null;
+      audioUploadBusy = false;
+      audioUploadStatus.textContent = audioInput.files.length
+        ? 'Click Upload to prepare audio and warm up GPU.'
+        : 'Select a file, click Upload, then Start streaming.';
+      audioUploadStatus.classList.remove('audio-upload-ok');
+      if (audioInput.files.length) {
+        audioUploadBtn.style.display = 'inline-block';
+        audioUploadBtn.disabled = false;
+        audioUploadBtn.textContent = 'Upload';
+      } else {
+        audioUploadBtn.style.display = 'none';
+        audioUploadBtn.disabled = true;
+      }
+      updateSubmitEnabled();
+    }
+
+    async function waitForAudioWarmup(token) {
+      for (let attempt = 0; attempt < 600; attempt++) {
+        const res = await fetch('/api/audio-warmup/' + encodeURIComponent(token), { cache: 'no-store' });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Warmup status failed');
+        if (data.state === 'ready') {
+          audioWarmupReady = true;
+          audioUploadStatus.textContent = 'Ready: ' + (data.filename || 'audio') + ' — click Start streaming';
+          audioUploadStatus.classList.add('audio-upload-ok');
+          updateSubmitEnabled();
+          setStatus('Model and GPU ready. Click Start streaming to play.');
+          return;
+        }
+        if (data.state === 'error') throw new Error(data.error || 'Warmup failed');
+        audioUploadStatus.textContent = data.message || 'Warming up model and GPU...';
+        await new Promise((resolve) => setTimeout(resolve, 400));
+      }
+      throw new Error('Warmup timed out — try uploading again.');
     }
 
     connHint.textContent = 'Page URL: ' + window.location.href;
@@ -546,6 +649,8 @@ INDEX_HTML = """<!DOCTYPE html>
       videoEl.addEventListener('playing', () => {
         if (sessionId !== streamSession) return;
         avStarted = true;
+        markClientFirstFrame();
+        updateTimingDisplay({});
         previewImg.style.display = 'none';
         videoEl.muted = false;
         videoEl.volume = 1.0;
@@ -597,6 +702,7 @@ INDEX_HTML = """<!DOCTYPE html>
       avStarted = false;
       activeJobId = null;
       terminalJobHandled = null;
+      resetTimingDisplay();
       stopMSEPlayer();
       stopPreview();
       streamSession += 1;
@@ -638,9 +744,11 @@ INDEX_HTML = """<!DOCTYPE html>
           const last = data.timing[data.timing.length - 1];
           msg += ` [${last.step}: ${last.total_ms}ms]`;
         }
+        updateTimingDisplay(data);
 
         const busy = ['preparing', 'streaming', 'loading', 'uploading'].includes(data.state);
-        submitBtn.disabled = busy || pendingNewJob;
+        serverBusy = busy || pendingNewJob;
+        updateSubmitEnabled();
 
         if (pendingNewJob) {
           setStatus(msg);
@@ -699,21 +807,68 @@ INDEX_HTML = """<!DOCTYPE html>
         }
 
         if (['idle', 'done', 'error', 'cancelled'].includes(data.state)) {
-          submitBtn.disabled = false;
+          serverBusy = false;
+          updateSubmitEnabled();
           if (['idle', 'error', 'cancelled'].includes(data.state)) {
             beginSlowPolling();
           }
         }
       } catch (err) {
         setStatus('Server connection failed: ' + err.message);
-        submitBtn.disabled = false;
+        serverBusy = false;
         pendingNewJob = false;
+        updateSubmitEnabled();
       }
     }
 
-    let inputMode = 'text';
-    let videoMode = 'preset';
-    let selectedPreset = 'model1';
+    audioInput.addEventListener('change', () => {
+      resetAudioUpload();
+    });
+
+    audioUploadBtn.addEventListener('click', async () => {
+      const file = audioInput.files[0];
+      if (!file) {
+        setStatus('Please select an audio file first.');
+        return;
+      }
+      audioUploadBusy = true;
+      audioUploaded = false;
+      audioWarmupReady = false;
+      audioToken = null;
+      audioUploadBtn.disabled = true;
+      audioUploadBtn.textContent = 'Uploading...';
+      audioUploadStatus.textContent = 'Uploading audio...';
+      audioUploadStatus.classList.remove('audio-upload-ok');
+      updateSubmitEnabled();
+
+      const body = new FormData();
+      body.append('audio', file);
+      if (videoMode === 'preset') {
+        body.append('preset_model', selectedPreset);
+      }
+
+      try {
+        const res = await fetch('/api/upload-audio', { method: 'POST', body });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Audio upload failed');
+        audioUploaded = true;
+        audioToken = data.audio_token;
+        audioUploadBtn.textContent = 'Uploaded';
+        setStatus('Audio uploaded — warming up model and GPU...');
+        await waitForAudioWarmup(audioToken);
+      } catch (err) {
+        audioUploaded = false;
+        audioWarmupReady = false;
+        audioToken = null;
+        audioUploadStatus.textContent = 'Upload failed: ' + err.message;
+        audioUploadBtn.textContent = 'Upload';
+        audioUploadBtn.disabled = false;
+        setStatus('Audio upload error: ' + err.message);
+      } finally {
+        audioUploadBusy = false;
+        updateSubmitEnabled();
+      }
+    });
 
     document.querySelectorAll('#video-mode-tabs .mode-tab').forEach((btn) => {
       btn.addEventListener('click', () => {
@@ -742,13 +897,13 @@ INDEX_HTML = """<!DOCTYPE html>
         document.querySelectorAll('#speech-mode-tabs .mode-tab').forEach((b) => b.classList.toggle('active', b.dataset.mode === inputMode));
         document.getElementById('panel-text').classList.toggle('active', inputMode === 'text');
         document.getElementById('panel-audio').classList.toggle('active', inputMode === 'audio');
+        updateSubmitEnabled();
       });
     });
 
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
       const video = document.getElementById('video').files[0];
-      const audio = document.getElementById('audio').files[0];
       const text = document.getElementById('text').value.trim();
       if (videoMode === 'custom' && !video) {
         setStatus('Please upload a reference video.');
@@ -758,13 +913,19 @@ INDEX_HTML = """<!DOCTYPE html>
         setStatus('Please enter text for TTS.');
         return;
       }
-      if (inputMode === 'audio' && !audio) {
-        setStatus('Please select an audio file.');
+      if (inputMode === 'audio' && (!audioUploaded || !audioWarmupReady)) {
+        setStatus(!audioUploaded
+          ? 'Please upload an audio file first (click Upload).'
+          : 'Preparing model and GPU — please wait...');
         return;
       }
 
       submitBtn.disabled = true;
+      serverBusy = true;
       resetStreamView();
+      jobStartMs = Date.now();
+      clientDisplayMs = null;
+      if (timingEl) timingEl.textContent = '';
       const busyMsg = inputMode === 'text'
         ? (videoMode === 'preset' ? 'Starting local TTS + progressive stream...' : 'Uploading video and starting stream...')
         : (videoMode === 'preset' ? 'Starting stream with preset model...' : 'Uploading files...');
@@ -781,7 +942,7 @@ INDEX_HTML = """<!DOCTYPE html>
         body.append('text', text);
         body.append('tts_voice', document.getElementById('tts_voice').value);
       } else {
-        body.append('audio', audio);
+        body.append('audio_token', audioToken);
       }
 
       try {
@@ -796,13 +957,15 @@ INDEX_HTML = """<!DOCTYPE html>
         pollStatus();
       } catch (err) {
         setStatus('Error: ' + err.message);
-        submitBtn.disabled = false;
+        serverBusy = false;
         pendingNewJob = false;
+        updateSubmitEnabled();
       }
     });
 
     pollStatus();
     beginSlowPolling();
+    updateSubmitEnabled();
   </script>
 </body>
 </html>
@@ -820,19 +983,16 @@ def autotune_batch_sizes(args, device):
     if gb_free >= 40 or gb_total >= 70:
         args.batch_size = max(args.batch_size, 64)
         args.stream_batch_size = max(args.stream_batch_size, 48)
-        args.stream_first_batch_size = max(args.stream_first_batch_size, 12)
     elif gb_free >= 20:
         args.batch_size = max(args.batch_size, 40)
         args.stream_batch_size = max(args.stream_batch_size, 32)
-        args.stream_first_batch_size = max(args.stream_first_batch_size, 8)
     elif gb_free >= 8:
         args.batch_size = max(args.batch_size, 24)
         args.stream_batch_size = max(args.stream_batch_size, 16)
-        args.stream_first_batch_size = max(args.stream_first_batch_size, 8)
     elif gb_free >= 5:
         args.batch_size = max(args.batch_size, 16)
         args.stream_batch_size = max(args.stream_batch_size, 12)
-        args.stream_first_batch_size = max(args.stream_first_batch_size, 6)
+    args.stream_first_batch_size = max(1, min(args.stream_first_batch_size, 2))
     print(
         f"VRAM {gb_free:.1f}GB free / {gb_total:.1f}GB total — "
         f"stream_batch={args.stream_batch_size}, first_batch={args.stream_first_batch_size}, "
@@ -1396,6 +1556,12 @@ class PipedFFmpegMuxer:
     def _even_dim(n: int) -> int:
         return n if n % 2 == 0 else n - 1
 
+    def prestart(self, width: int, height: int):
+        with self._lock:
+            if self._error or self._started:
+                return
+            self._start(width, height)
+
     def _start(self, width: int, height: int):
         width = self._even_dim(width)
         height = self._even_dim(height)
@@ -1610,9 +1776,13 @@ class StreamWebService:
         self._mux_worker = None
         self._frame_archive = []
         self._job_timers = {}
+        self._job_inference_t0 = {}
+        self._job_first_frame_ms = {}
         self._avatar_cache = {}  # video_hash -> Avatar (kept while reference video unchanged)
         self._preset_preload = {}  # preset_id -> pending|loading|ready|error
         self._preload_lock = threading.Lock()
+        self._audio_staging = {}
+        self._staging_lock = threading.Lock()
         self._live_segment_mux = False
         self._live_ts_offset = 0.0
         self._chunk_pcm = None
@@ -1765,6 +1935,30 @@ class StreamWebService:
                 status["audio_url"] = self._status.get("audio_url")
             self._status = status
         print(f"[{state}] {message}")
+
+    def mark_inference_start(self, job_id: str):
+        """Mark UNet/VAE lip-sync loop start (Whisper/TTS prep excluded)."""
+        with self._lock:
+            if job_id in self._job_inference_t0:
+                return
+            self._job_inference_t0[job_id] = time.time()
+            self._job_first_frame_ms.pop(job_id, None)
+
+    def _record_first_lipsync_frame(self, job_id: str):
+        with self._lock:
+            t0 = self._job_inference_t0.get(job_id)
+            if t0 is None or job_id in self._job_first_frame_ms:
+                return None
+            ms = round((time.time() - t0) * 1000, 1)
+            self._job_first_frame_ms[job_id] = ms
+        print(f"[timing:{job_id[:8]}] first_lipsync_frame: {ms}ms after UNet inference start", flush=True)
+        with self._lock:
+            if self._status.get("job_id") == job_id:
+                note = f"First frame in {ms} ms"
+                prev = self._status.get("message") or ""
+                if note not in prev:
+                    self._status["message"] = f"{note} — {prev}"
+        return ms
 
     def _reset_av_stream(self, job_id, audio_path=None, piped=False, upload_dir=None):
         if self._mux_worker is not None:
@@ -2020,7 +2214,42 @@ class StreamWebService:
         elif job_id and os.path.isfile(progressive_mp4_path(job_id)):
             status["stream_bytes"] = os.path.getsize(progressive_mp4_path(job_id))
         status["frames_streamed"] = len(self._frame_archive)
+        if job_id:
+            if job_id in self._job_first_frame_ms:
+                status["first_frame_ms"] = self._job_first_frame_ms[job_id]
+            elif job_id in self._job_inference_t0:
+                status["inference_elapsed_ms"] = round(
+                    (time.time() - self._job_inference_t0[job_id]) * 1000, 1
+                )
         return status
+
+    def _ensure_piped_encoder(self, width: int, height: int):
+        if not (self._mux_frames and self._mp4_buffer is not None and self._piped_mux):
+            return
+        if self._av_encoder is None:
+            self._av_encoder = PipedFFmpegMuxer(
+                self.args.fps,
+                self._tts_sample_rate,
+                self._mp4_buffer,
+                self._av_output_path,
+                use_gpu=USE_FFMPEG_GPU,
+                frag_duration_us=self.args.fmp4_frag_us,
+            )
+            self._av_encoder.prestart(width, height)
+
+    def _prepare_prewarmed_stream(self, prewarm):
+        if not prewarm or not self._piped_mux:
+            return
+        if prewarm.get("pcm_bytes"):
+            self._enqueue_chunk_audio(prewarm["pcm_bytes"], prewarm["pcm_sr"])
+        if not prewarm.get("avatar_ready"):
+            return
+        avatar = self._avatar_cache.get(prewarm.get("video_hash"))
+        if not avatar or not avatar.frame_list_cycle:
+            return
+        frame = avatar.frame_list_cycle[0]
+        h, w = frame.shape[:2]
+        self._ensure_piped_encoder(w, h)
 
     def _write_mux_frame(self, frame_bgr: np.ndarray):
         if not (self._mux_frames and self._av_output_path and self._mp4_buffer is not None):
@@ -2087,6 +2316,8 @@ class StreamWebService:
         self._frame_event.set()
 
         if self._mux_frames and not preview_only:
+            if self._current_job_id:
+                self._record_first_lipsync_frame(self._current_job_id)
             self._frame_archive.append(frame_bgr.copy())
             if self._piped_mux:
                 self._submit_piped_av_frame(frame_bgr)
@@ -2159,6 +2390,7 @@ class StreamWebService:
         video_path, preset_model = self._resolve_video_path(form, upload_dir)
 
         text_val = form.getvalue("text", "").strip() if "text" in form else ""
+        audio_token = form.getvalue("audio_token", "").strip() if "audio_token" in form else ""
         audio_item = form["audio"] if "audio" in form else None
         has_audio_file = audio_item is not None and getattr(audio_item, "filename", None)
 
@@ -2168,7 +2400,11 @@ class StreamWebService:
             with open(text_path, "w", encoding="utf-8") as f:
                 f.write(text_val)
             print(f"TTS queued (local Piper): voice={voice}, chars={len(text_val)}")
-            return video_path, None, True, preset_model, text_val, voice
+            return video_path, None, True, preset_model, text_val, voice, None
+        elif audio_token:
+            audio_path, prewarm = self._consume_staged_session(audio_token, upload_dir)
+            print(f"Using pre-warmed audio: token={audio_token[:8]}... -> {audio_path}")
+            return video_path, audio_path, False, preset_model, None, None, prewarm
         elif has_audio_file:
             audio_ext = os.path.splitext(audio_item.filename)[1] or ".wav"
             raw_path = os.path.join(upload_dir, f"audio_upload{audio_ext}")
@@ -2179,7 +2415,7 @@ class StreamWebService:
         else:
             raise ValueError("Provide text for TTS or upload an audio file.")
 
-        return video_path, audio_path, False, preset_model, None, None
+        return video_path, audio_path, False, preset_model, None, None, None
 
     def _resolve_avatar(self, video_path):
         video_hash = compute_file_hash(video_path)
@@ -2330,16 +2566,28 @@ class StreamWebService:
         text=None,
         voice=None,
         upload_dir=None,
+        prewarm=None,
     ):
         import scripts.realtime_inference as rt
 
         try:
-            avatar, memory_cached = self._get_or_create_avatar(
-                video_path, avatar_id, need_preparation, video_hash
-            )
+            avatar_ready = prewarm and prewarm.get("avatar_ready") and prewarm.get("video_hash") == video_hash
+            if avatar_ready:
+                avatar = self._avatar_cache.get(video_hash)
+                if avatar is None:
+                    avatar_ready = False
+            if not avatar_ready:
+                avatar, memory_cached = self._get_or_create_avatar(
+                    video_path, avatar_id, need_preparation, video_hash
+                )
+            else:
+                avatar = self._avatar_cache[video_hash]
+                avatar.idx = 0
+                memory_cached = prewarm.get("memory_cached", True)
+                print(f"Using pre-warmed avatar: {avatar_id}")
             use_cache = use_cache or memory_cached
 
-            if need_preparation and not self._cancel_event.is_set():
+            if need_preparation and not avatar_ready and not self._cancel_event.is_set():
                 self._register_cache(video_hash, avatar_id, video_path)
 
             if self._cancel_event.is_set():
@@ -2356,7 +2604,17 @@ class StreamWebService:
                     text, voice, avatar, job_id, upload_dir, use_cache, memory_cached
                 )
             else:
-                if memory_cached:
+                if prewarm and prewarm.get("avatar_ready"):
+                    self.set_status(
+                        "streaming",
+                        "Pre-warmed lip-sync stream starting...",
+                        cached=True,
+                        job_id=job_id,
+                        stream_url=stream_url,
+                        result_url=result_url,
+                        audio_url=audio_url,
+                    )
+                elif memory_cached:
                     self.set_status(
                         "streaming",
                         "Reusing face model — progressive A/V stream starting...",
@@ -2376,10 +2634,14 @@ class StreamWebService:
                         result_url=result_url,
                         audio_url=audio_url,
                     )
-                self._begin_av_mux()
-                if self._piped_mux and audio_path and os.path.isfile(audio_path):
-                    pcm_bytes, sample_rate = self._load_wav_pcm(audio_path)
-                    self._enqueue_chunk_audio(pcm_bytes, sample_rate)
+                if not prewarm:
+                    self._begin_av_mux()
+                whisper_chunks = prewarm.get("whisper_chunks") if prewarm else None
+                if self._piped_mux:
+                    if not (prewarm and prewarm.get("pcm_bytes")):
+                        if audio_path and os.path.isfile(audio_path):
+                            pcm_bytes, sample_rate = self._load_wav_pcm(audio_path)
+                            self._enqueue_chunk_audio(pcm_bytes, sample_rate)
                 elif self._live_segment_mux and audio_path and os.path.isfile(audio_path):
                     import soundfile as sf
 
@@ -2391,9 +2653,10 @@ class StreamWebService:
                     self.args.fps,
                     skip_save_images=True,
                     frame_sink=self,
-                    stream_fps=self.args.fps,
+                    stream_fps=None,
                     batch_size=self.args.stream_batch_size,
                     first_batch_size=self.args.stream_first_batch_size,
+                    whisper_chunks=whisper_chunks,
                 )
 
             timer = self._job_timers.get(job_id)
@@ -2436,7 +2699,7 @@ class StreamWebService:
         except Exception:
             return False
 
-    def start_job(self, video_path, audio_path, job_id, text=None, voice=None, upload_dir=None, piped=False, live_segment=False):
+    def start_job(self, video_path, audio_path, job_id, text=None, voice=None, upload_dir=None, piped=False, live_segment=False, prewarm=None):
         if not self._models_ready.is_set():
             raise RuntimeError("Models are still loading.")
 
@@ -2455,23 +2718,26 @@ class StreamWebService:
         self._live_segment_mux = live_segment
         self._segment_mux = False
         self._frames_pushed = 0
+        if prewarm:
+            self._begin_av_mux()
+            self._prepare_prewarmed_stream(prewarm)
         self.push_status_frame("Starting...")
 
         self._worker = threading.Thread(
             target=self._run_job,
             args=(video_path, audio_path, avatar_id, need_preparation, video_hash, use_cache, job_id),
-            kwargs={"text": text, "voice": voice, "upload_dir": upload_dir},
+            kwargs={"text": text, "voice": voice, "upload_dir": upload_dir, "prewarm": prewarm},
             daemon=True,
         )
         self._worker.start()
 
-    def handle_upload(self, handler):
+    @staticmethod
+    def _parse_multipart_form(handler):
         content_type = handler.headers.get("Content-Type", "")
         content_length = handler.headers.get("Content-Length", "0")
         if "multipart/form-data" not in content_type:
             raise ValueError("multipart/form-data is required.")
-
-        form = cgi.FieldStorage(
+        return cgi.FieldStorage(
             fp=handler.rfile,
             headers=handler.headers,
             environ={
@@ -2481,25 +2747,215 @@ class StreamWebService:
             },
         )
 
+    def handle_audio_upload(self, handler):
+        form = self._parse_multipart_form(handler)
+        audio_item = form["audio"] if "audio" in form else None
+        if audio_item is None or not getattr(audio_item, "filename", None):
+            raise ValueError("No audio file in upload.")
+
+        preset_model = form.getvalue("preset_model", "").strip() if "preset_model" in form else ""
+
+        token = uuid.uuid4().hex
+        staging_dir = os.path.join(UPLOAD_ROOT, "staging", token)
+        os.makedirs(staging_dir, exist_ok=True)
+        audio_ext = os.path.splitext(audio_item.filename)[1] or ".wav"
+        raw_path = os.path.join(staging_dir, f"audio_upload{audio_ext}")
+        with open(raw_path, "wb") as f:
+            f.write(audio_item.file.read())
+        audio_path = ensure_wav(raw_path, os.path.join(staging_dir, "audio_16k.wav"))
+        print(f"Audio staged: {audio_item.filename} -> {audio_path} (token={token[:8]}...)")
+
+        with self._staging_lock:
+            self._audio_staging[token] = {
+                "path": audio_path,
+                "filename": audio_item.filename,
+                "preset_model": preset_model or None,
+                "warmup_state": "pending",
+                "warmup_message": "Queued for warmup",
+                "warmup_error": None,
+            }
+
+        threading.Thread(
+            target=self._warmup_staged_audio,
+            args=(token,),
+            daemon=True,
+        ).start()
+
+        return {
+            "ok": True,
+            "audio_token": token,
+            "filename": audio_item.filename,
+            "warming": True,
+            "message": "Audio uploaded — warming up model and GPU...",
+        }
+
+    def get_audio_warmup_status(self, token: str):
+        with self._staging_lock:
+            entry = self._audio_staging.get(token)
+        if not entry:
+            return {"ok": False, "error": "Unknown or expired audio token.", "state": "error"}
+        state = entry.get("warmup_state", "pending")
+        payload = {
+            "ok": True,
+            "state": state,
+            "filename": entry.get("filename"),
+            "message": entry.get("warmup_message") or "",
+        }
+        if state == "error":
+            payload["error"] = entry.get("warmup_error") or "Warmup failed"
+        return payload
+
+    def _set_staging_warmup(self, token: str, **updates):
+        with self._staging_lock:
+            entry = self._audio_staging.get(token)
+            if entry is not None:
+                entry.update(updates)
+
+    def _warmup_staged_audio(self, token: str):
+        if not self._models_ready.is_set():
+            self._models_ready.wait(timeout=600)
+        with self._staging_lock:
+            entry = self._audio_staging.get(token)
+            if entry is None:
+                return
+        self._set_staging_warmup(token, warmup_state="warming", warmup_message="Extracting Whisper features on GPU...")
+        try:
+            import scripts.realtime_inference as rt
+
+            audio_path = entry["path"]
+            preset_model = entry.get("preset_model")
+
+            whisper_input_features, librosa_length = rt.audio_processor.get_audio_feature(
+                audio_path, weight_dtype=rt.weight_dtype
+            )
+            whisper_chunks = rt.audio_processor.get_whisper_chunk(
+                whisper_input_features,
+                rt.device,
+                rt.weight_dtype,
+                rt.whisper,
+                librosa_length,
+                fps=self.args.fps,
+                audio_padding_length_left=self.args.audio_padding_length_left,
+                audio_padding_length_right=self.args.audio_padding_length_right,
+            )
+            pcm_bytes, pcm_sr = self._load_wav_pcm(audio_path)
+
+            prewarm = {
+                "whisper_chunks": whisper_chunks,
+                "pcm_bytes": pcm_bytes,
+                "pcm_sr": pcm_sr,
+                "avatar_ready": False,
+                "memory_cached": False,
+                "video_hash": None,
+                "video_path": None,
+                "preset_model": preset_model,
+            }
+
+            if preset_model and preset_model in PRESET_MODELS:
+                self._set_staging_warmup(token, warmup_message=f"Loading preset {preset_model} face model...")
+                video_path = os.path.abspath(PRESET_MODELS[preset_model])
+                avatar_id, need_preparation, video_hash = self._resolve_avatar(video_path)
+                avatar, memory_cached = self._get_or_create_avatar(
+                    video_path, avatar_id, need_preparation, video_hash, quiet=True
+                )
+                if need_preparation and not self._cancel_event.is_set():
+                    self._register_cache(video_hash, avatar_id, video_path)
+                prewarm.update(
+                    {
+                        "avatar_ready": True,
+                        "memory_cached": memory_cached,
+                        "video_hash": video_hash,
+                        "video_path": video_path,
+                        "avatar_id": avatar_id,
+                    }
+                )
+                self._set_staging_warmup(
+                    token,
+                    warmup_message="Running GPU inference warmup...",
+                )
+                if torch.cuda.is_available() and whisper_chunks.shape[0] > 0:
+                    batch_n = min(self.args.stream_first_batch_size, whisper_chunks.shape[0])
+                    dummy_latent = avatar.input_latent_list_cycle[:batch_n]
+                    from musetalk.utils.utils import datagen
+
+                    gen = datagen(
+                        whisper_chunks[:batch_n],
+                        dummy_latent,
+                        batch_n,
+                        first_batch_size=batch_n,
+                    )
+                    whisper_batch, latent_batch = next(iter(gen))
+                    audio_feature_batch = rt.pe(whisper_batch.to(rt.device, non_blocking=True))
+                    latent_batch = latent_batch.to(device=rt.device, dtype=rt.unet.model.dtype, non_blocking=True)
+                    pred_latents = rt.unet.model(
+                        latent_batch,
+                        rt.timesteps,
+                        encoder_hidden_states=audio_feature_batch,
+                    ).sample
+                    rt.vae.decode_latents(pred_latents.to(device=rt.device, dtype=rt.vae.vae.dtype))
+                    torch.cuda.synchronize()
+
+            self._set_staging_warmup(
+                token,
+                warmup_state="ready",
+                warmup_message="Ready — click Start streaming",
+                warmup_error=None,
+                prewarm=prewarm,
+            )
+            print(f"Audio warmup ready: token={token[:8]}..., frames={whisper_chunks.shape[0]}")
+        except Exception as exc:
+            print(f"Audio warmup failed ({token[:8]}...): {exc}")
+            self._set_staging_warmup(
+                token,
+                warmup_state="error",
+                warmup_error=str(exc),
+                warmup_message=f"Warmup failed: {exc}",
+            )
+
+    def _consume_staged_session(self, token, upload_dir):
+        with self._staging_lock:
+            entry = self._audio_staging.pop(token, None)
+        if not entry:
+            raise ValueError("Audio upload expired or invalid. Please upload the audio file again.")
+        if entry.get("warmup_state") != "ready":
+            raise ValueError("Audio is still warming up. Please wait until preparation completes.")
+        src = entry["path"]
+        if not os.path.isfile(src):
+            raise ValueError("Uploaded audio file is missing. Please upload again.")
+        dest = os.path.join(upload_dir, "audio_16k.wav")
+        shutil.copy2(src, dest)
+        prewarm = dict(entry.get("prewarm") or {})
+        prewarm["staging_path"] = src
+        return dest, prewarm
+
+    def handle_upload(self, handler):
+        form = self._parse_multipart_form(handler)
+
         job_id = uuid.uuid4().hex
         upload_dir = os.path.join(UPLOAD_ROOT, job_id)
-        video_path, audio_path, used_tts, preset_model, text_val, voice = self._save_upload(form, job_id)
+        video_path, audio_path, used_tts, preset_model, text_val, voice, prewarm = self._save_upload(form, job_id)
         if audio_path:
             self._job_audio_paths[job_id] = audio_path
         avatar_id, need_preparation, video_hash = self._resolve_avatar(video_path)
         memory_cached = video_hash in self._avatar_cache and not need_preparation
         if preset_model and self.is_preset_preloaded(preset_model):
             memory_cached = True
+        if prewarm and prewarm.get("avatar_ready"):
+            memory_cached = True
 
         if used_tts:
             tts_note = "Local TTS streaming. "
+        elif prewarm:
+            tts_note = "Pre-warmed — "
         else:
             tts_note = ""
         if preset_model:
             model_note = f"Preset {preset_model}. "
         else:
             model_note = ""
-        if memory_cached:
+        if prewarm and prewarm.get("avatar_ready"):
+            message = model_note + tts_note + "Starting lip-sync stream immediately."
+        elif memory_cached:
             message = model_note + tts_note + "Reusing loaded face model — starting stream."
         elif need_preparation:
             message = model_note + tts_note + "Running face analysis, then A/V streaming will start."
@@ -2524,6 +2980,7 @@ class StreamWebService:
             upload_dir=upload_dir,
             piped=self.args.progressive_mode == "piped",
             live_segment=self.args.progressive_mode == "segment",
+            prewarm=prewarm,
         )
 
         return {
@@ -2744,6 +3201,11 @@ class StreamWebService:
                     self._send_json(service.get_status())
                     return
 
+                if path.startswith("/api/audio-warmup/"):
+                    token = path.replace("/api/audio-warmup/", "").split("?")[0]
+                    self._send_json(service.get_audio_warmup_status(token))
+                    return
+
                 if path.startswith("/api/progressive/") or path.startswith("/api/stream/"):
                     job_id = path.replace("/api/progressive/", "").replace("/api/stream/", "").replace(".mp4", "")
                     service.serve_progressive_mp4(self, job_id, send_body=True)
@@ -2833,7 +3295,15 @@ class StreamWebService:
                 self.send_error(404)
 
             def do_POST(self):
-                if urlparse(self.path).path != "/api/start":
+                path = urlparse(self.path).path
+                if path == "/api/upload-audio":
+                    try:
+                        payload = service.handle_audio_upload(self)
+                        self._send_json(payload)
+                    except Exception as exc:
+                        self._send_json({"ok": False, "error": str(exc)}, status=400)
+                    return
+                if path != "/api/start":
                     self.send_error(404)
                     return
                 try:
@@ -2887,8 +3357,8 @@ def parse_args():
     parser.add_argument(
         "--stream_first_batch_size",
         type=int,
-        default=8,
-        help="First UNet batch — balance first-frame latency vs GPU fill",
+        default=1,
+        help="First UNet batch — 1 minimizes first-frame latency",
     )
     parser.add_argument(
         "--stream_emit_frames",
@@ -2912,8 +3382,8 @@ def parse_args():
     parser.add_argument(
         "--fmp4_frag_us",
         type=int,
-        default=40000,
-        help="fMP4 fragment duration in microseconds for piped mode (lower = faster browser playback start)",
+        default=0,
+        help="fMP4 fragment duration in microseconds (0 = one video frame at --fps)",
     )
     parser.add_argument("--tts_first_chunk_chars", type=int, default=18, help="Max chars in first TTS chunk for low latency")
     parser.add_argument("--tts_chunk_chars", type=int, default=96, help="Max chars per follow-up TTS chunk")
@@ -2955,6 +3425,9 @@ def main():
 
     preload_list = [p.strip() for p in args.preload_presets.split(",") if p.strip()]
     args.preload_presets = preload_list
+
+    if args.fmp4_frag_us <= 0:
+        args.fmp4_frag_us = max(10000, 1_000_000 // max(1, args.fps))
 
     device = torch.device(f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
