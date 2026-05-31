@@ -491,6 +491,7 @@ INDEX_HTML = """<!DOCTYPE html>
         this._abortController = null;
         this._sourceOpenHandler = null;
         this.framer = null;
+        this._waitingForData = false;
       }
 
       isStale() {
@@ -562,11 +563,20 @@ INDEX_HTML = """<!DOCTYPE html>
         });
         this.sourceBuffer.addEventListener('updateend', () => {
           this.framer.onUpdateEnd();
-          if (this.video.paused && this.sourceBuffer.buffered.length) {
-            this.video.play().catch(() => {
+          if (!this.sourceBuffer.buffered.length) return;
+          const end = this.sourceBuffer.buffered.end(this.sourceBuffer.buffered.length - 1);
+          const ahead = end - this.video.currentTime;
+          const minBuffer = this._waitingForData ? 2.0 : 4.0;
+          if ((this.video.paused || this._waitingForData) && ahead >= minBuffer) {
+            this.video.play().then(() => {
+              this._waitingForData = false;
+            }).catch(() => {
               if (!this.isStale()) setStatus('Streaming — click Play on the video player.');
             });
           }
+        });
+        this.video.addEventListener('waiting', () => {
+          if (!this.isStale()) this._waitingForData = true;
         });
         this.fetchStream();
       }
@@ -993,9 +1003,17 @@ def autotune_batch_sizes(args, device):
         args.batch_size = max(args.batch_size, 16)
         args.stream_batch_size = max(args.stream_batch_size, 12)
     args.stream_first_batch_size = max(1, min(args.stream_first_batch_size, 2))
+    ramp = getattr(args, "stream_ramp_batch_size", 4)
+    args.stream_ramp_batch_size = max(2, min(ramp, args.stream_batch_size))
+    args.stream_ramp_batches = max(2, getattr(args, "stream_ramp_batches", 4))
+    if getattr(args, "progressive_mode", "piped") == "piped":
+        args.stream_batch_size = min(args.stream_batch_size, 16)
+        args.stream_ramp_batch_size = min(args.stream_ramp_batch_size, 4)
+        args.stream_ramp_batches = max(args.stream_ramp_batches, 6)
     print(
         f"VRAM {gb_free:.1f}GB free / {gb_total:.1f}GB total — "
         f"stream_batch={args.stream_batch_size}, first_batch={args.stream_first_batch_size}, "
+        f"ramp={args.stream_ramp_batch_size}x{args.stream_ramp_batches}, "
         f"avatar_batch={args.batch_size}",
         flush=True,
     )
@@ -1453,7 +1471,7 @@ class VideoStdinWriter:
 
     def __init__(self, proc: subprocess.Popen):
         self._proc = proc
-        self._queue = queue.Queue(maxsize=128)
+        self._queue = queue.Queue(maxsize=4096)
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -1710,13 +1728,14 @@ class PipedFFmpegMuxer:
 
 
 class MuxWorker:
-    """Background thread: write one audio slice + one video frame per tick (keeps FFmpeg pipes in sync)."""
+    """Feed FFmpeg immediately; throttle only when many seconds of frames are queued."""
 
     _SENTINEL = ("__stop__", None)
+    HIGH_WATER_SEC = 10.0
 
     def __init__(self, service: "StreamWebService"):
         self.service = service
-        self._queue = queue.Queue(maxsize=1024)
+        self._queue = queue.Queue()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -1724,10 +1743,16 @@ class MuxWorker:
         self._queue.put(("pair", frame_bgr.copy(), pcm_bytes))
 
     def finish(self):
+        self._drain_fast = True
         self._queue.put(self._SENTINEL)
-        self._thread.join(timeout=120)
+        self._thread.join(timeout=900)
 
     def _run(self):
+        fps = max(1, self.service.args.fps)
+        interval = 1.0 / fps
+        wall_start = None
+        emitted = 0
+        self._drain_fast = False
         while True:
             item = self._queue.get()
             if item == self._SENTINEL:
@@ -1735,9 +1760,19 @@ class MuxWorker:
             try:
                 if item[0] == "pair":
                     _, frame, pcm = item
-                    # Start FFmpeg on first frame, then feed audio+video in lockstep.
+                    ahead_sec = self._queue.qsize() / fps
+                    if not self._drain_fast and ahead_sec >= self.HIGH_WATER_SEC:
+                        if wall_start is None:
+                            wall_start = time.monotonic()
+                        target = wall_start + emitted * interval
+                        delay = target - time.monotonic()
+                        if delay > 0:
+                            time.sleep(delay)
+                    else:
+                        wall_start = None
                     self.service._write_mux_frame(frame)
                     self.service._write_mux_audio(pcm)
+                    emitted += 1
             except Exception as exc:
                 print(f"[mux-worker] pair error: {exc}", flush=True)
         if self.service._av_encoder is not None:
@@ -2287,9 +2322,14 @@ class StreamWebService:
         return data.tobytes(), int(sample_rate)
 
     def _enqueue_chunk_audio(self, pcm_bytes: bytes, sample_rate: int):
-        bytes_per_frame = max(2, int(round(sample_rate / self.args.fps) * 2))
-        self._tts_sample_rate = sample_rate
-        self._audio_bytes_per_frame = bytes_per_frame
+        bpf = max(2, int(round(sample_rate / self.args.fps) * 2))
+        if self._audio_bytes_per_frame is None:
+            self._tts_sample_rate = sample_rate
+            self._audio_bytes_per_frame = bpf
+            self._audio_byte_queue = bytearray()
+        elif sample_rate != self._tts_sample_rate:
+            self._tts_sample_rate = sample_rate
+            self._audio_bytes_per_frame = bpf
         self._audio_byte_queue.extend(pcm_bytes)
 
     def _take_paced_pcm(self) -> bytes:
@@ -2298,9 +2338,11 @@ class StreamWebService:
             pcm = bytes(self._audio_byte_queue[:n])
             del self._audio_byte_queue[:n]
             return pcm
-        pcm = bytes(self._audio_byte_queue) + b"\x00" * (n - len(self._audio_byte_queue))
-        self._audio_byte_queue.clear()
-        return pcm
+        if self._audio_byte_queue:
+            pcm = bytes(self._audio_byte_queue)
+            self._audio_byte_queue.clear()
+            return pcm + b"\x00" * (n - len(pcm))
+        return b"\x00" * n
 
     def _submit_piped_av_frame(self, frame_bgr: np.ndarray):
         if not self._piped_mux or not self._audio_bytes_per_frame:
@@ -2361,6 +2403,17 @@ class StreamWebService:
             return None
         ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
         return encoded.tobytes() if ok else None
+
+    def _stream_inference_kwargs(self):
+        return {
+            "batch_size": self.args.stream_batch_size,
+            "first_batch_size": self.args.stream_first_batch_size,
+            "ramp_batch_size": self.args.stream_ramp_batch_size,
+            "ramp_batches": self.args.stream_ramp_batches,
+            "skip_save_images": True,
+            "frame_sink": self,
+            "stream_fps": None,
+        }
 
     def _resolve_video_path(self, form, upload_dir):
         preset_model = form.getvalue("preset_model", "").strip() if "preset_model" in form else ""
@@ -2529,11 +2582,7 @@ class StreamWebService:
                     whisper_wav,
                     None,
                     self.args.fps,
-                    skip_save_images=True,
-                    frame_sink=self,
-                    stream_fps=None,
-                    batch_size=self.args.stream_batch_size,
-                    first_batch_size=self.args.stream_first_batch_size,
+                    **self._stream_inference_kwargs(),
                 )
                 timer.mark(f"inference_chunk_{idx} ({len(self._frame_archive) - frame_idx_before} frames)")
 
@@ -2651,12 +2700,8 @@ class StreamWebService:
                     audio_path,
                     None,
                     self.args.fps,
-                    skip_save_images=True,
-                    frame_sink=self,
-                    stream_fps=None,
-                    batch_size=self.args.stream_batch_size,
-                    first_batch_size=self.args.stream_first_batch_size,
                     whisper_chunks=whisper_chunks,
+                    **self._stream_inference_kwargs(),
                 )
 
             timer = self._job_timers.get(job_id)
@@ -3361,6 +3406,18 @@ def parse_args():
         help="First UNet batch — 1 minimizes first-frame latency",
     )
     parser.add_argument(
+        "--stream_ramp_batch_size",
+        type=int,
+        default=4,
+        help="UNet batch size for the first few batches after the first frame (smooth 1→2 transition)",
+    )
+    parser.add_argument(
+        "--stream_ramp_batches",
+        type=int,
+        default=4,
+        help="Number of ramp batches before switching to --stream_batch_size",
+    )
+    parser.add_argument(
         "--stream_emit_frames",
         type=int,
         default=1,
@@ -3383,7 +3440,7 @@ def parse_args():
         "--fmp4_frag_us",
         type=int,
         default=0,
-        help="fMP4 fragment duration in microseconds (0 = one video frame at --fps)",
+        help="fMP4 fragment duration in microseconds (0 = one second of video at --fps)",
     )
     parser.add_argument("--tts_first_chunk_chars", type=int, default=18, help="Max chars in first TTS chunk for low latency")
     parser.add_argument("--tts_chunk_chars", type=int, default=96, help="Max chars per follow-up TTS chunk")

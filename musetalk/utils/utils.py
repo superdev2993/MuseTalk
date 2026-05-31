@@ -46,6 +46,41 @@ def get_video_fps(video_path):
     video.release()
     return fps
 
+def stream_batch_limit(
+    batch_index: int,
+    batch_size: int,
+    first_batch_size=None,
+    ramp_batch_size=None,
+    ramp_batches: int = 0,
+) -> int:
+    if batch_index == 0 and first_batch_size is not None:
+        return first_batch_size
+    if ramp_batch_size is not None and ramp_batches > 0 and batch_index <= ramp_batches:
+        return ramp_batch_size
+    return batch_size
+
+
+def plan_stream_batches(
+    video_num: int,
+    batch_size: int,
+    first_batch_size=None,
+    ramp_batch_size=None,
+    ramp_batches: int = 0,
+):
+    sizes = []
+    remaining = video_num
+    batch_index = 0
+    while remaining > 0:
+        take = min(
+            stream_batch_limit(batch_index, batch_size, first_batch_size, ramp_batch_size, ramp_batches),
+            remaining,
+        )
+        sizes.append(take)
+        remaining -= take
+        batch_index += 1
+    return sizes
+
+
 def datagen(
     whisper_chunks,
     vae_encode_latents,
@@ -53,15 +88,18 @@ def datagen(
     delay_frame=0,
     device="cuda:0",
     first_batch_size=None,
+    ramp_batch_size=None,
+    ramp_batches=0,
 ):
     whisper_batch, latent_batch = [], []
-    current_batch_size = first_batch_size if first_batch_size is not None else batch_size
+    batch_index = 0
 
     def _emit():
-        nonlocal whisper_batch, latent_batch
+        nonlocal whisper_batch, latent_batch, batch_index
         stacked_whisper = torch.stack(whisper_batch)
         stacked_latent = torch.cat(latent_batch, dim=0)
         whisper_batch, latent_batch = [], []
+        batch_index += 1
         return stacked_whisper, stacked_latent
 
     for i, w in enumerate(whisper_chunks):
@@ -69,9 +107,11 @@ def datagen(
         whisper_batch.append(w)
         latent_batch.append(vae_encode_latents[idx])
 
-        if len(latent_batch) >= current_batch_size:
+        limit = stream_batch_limit(
+            batch_index, batch_size, first_batch_size, ramp_batch_size, ramp_batches
+        )
+        if len(latent_batch) >= limit:
             yield _emit()
-            current_batch_size = batch_size
 
     if latent_batch:
         yield _emit()

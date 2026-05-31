@@ -267,12 +267,16 @@ class Avatar:
         stream_fps=None,
         batch_size=None,
         first_batch_size=None,
+        ramp_batch_size=None,
+        ramp_batches=0,
         whisper_chunks=None,
     ):
         os.makedirs(self.avatar_path + '/tmp', exist_ok=True)
         print("start inference")
         effective_batch_size = batch_size if batch_size is not None else self.batch_size
         effective_first_batch_size = first_batch_size if first_batch_size is not None else effective_batch_size
+        effective_ramp_batch = ramp_batch_size if ramp_batch_size is not None else min(4, effective_batch_size)
+        effective_ramp_batches = max(0, ramp_batches)
         ############################################## extract audio feature ##############################################
         start_time = time.time()
         if whisper_chunks is None:
@@ -308,16 +312,22 @@ class Avatar:
             self.input_latent_list_cycle,
             effective_batch_size,
             first_batch_size=effective_first_batch_size,
+            ramp_batch_size=effective_ramp_batch,
+            ramp_batches=effective_ramp_batches,
         )
         start_time = time.time()
         batch_count = 0
-        remaining = video_num
-        expected_batches = 0
-        while remaining > 0:
-            take = effective_first_batch_size if expected_batches == 0 else effective_batch_size
-            take = min(take, remaining)
-            remaining -= take
-            expected_batches += 1
+        from musetalk.utils.utils import plan_stream_batches
+
+        expected_batches = len(
+            plan_stream_batches(
+                video_num,
+                effective_batch_size,
+                effective_first_batch_size,
+                effective_ramp_batch,
+                effective_ramp_batches,
+            )
+        )
 
         if frame_sink is not None and hasattr(frame_sink, "mark_inference_start"):
             job_id = getattr(frame_sink, "_current_job_id", None)

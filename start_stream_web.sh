@@ -20,7 +20,10 @@ nohup "$PYTHON" -m scripts.stream_web_app \
   --port "$PORT" \
   --fps 12 \
   --progressive_mode piped \
-  --stream_first_batch_size 32 \
+  --stream_first_batch_size 1 \
+  --stream_batch_size 16 \
+  --stream_ramp_batch_size 4 \
+  --stream_ramp_batches 8 \
   --fmp4_frag_us 0 \
   --tts_gpu \
   --tts_prefetch_workers 4 \
