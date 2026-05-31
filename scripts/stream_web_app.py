@@ -2422,8 +2422,8 @@ class StreamWebService:
         ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
         return encoded.tobytes() if ok else None
 
-    def _stream_inference_kwargs(self):
-        return {
+    def _stream_inference_kwargs(self, chunk_index=0):
+        kwargs = {
             "batch_size": self.args.stream_batch_size,
             "first_batch_size": self.args.stream_first_batch_size,
             "ramp_batch_size": self.args.stream_ramp_batch_size,
@@ -2431,7 +2431,12 @@ class StreamWebService:
             "skip_save_images": True,
             "frame_sink": self,
             "stream_fps": None,
+            "reset_avatar_idx": chunk_index == 0,
         }
+        if chunk_index > 0:
+            kwargs["first_batch_size"] = self.args.stream_batch_size
+            kwargs["ramp_batches"] = 0
+        return kwargs
 
     def _resolve_video_path(self, form, upload_dir):
         preset_model = form.getvalue("preset_model", "").strip() if "preset_model" in form else ""
@@ -2543,6 +2548,8 @@ class StreamWebService:
         self._job_timers[job_id] = timer
         timer.mark("chunks_ready")
 
+        avatar.idx = 0
+
         stream_url = f"/api/progressive/{job_id}.mp4"
         result_url = f"/api/result/{job_id}.mp4"
         audio_url = f"/api/audio/{job_id}"
@@ -2600,7 +2607,7 @@ class StreamWebService:
                     whisper_wav,
                     None,
                     self.args.fps,
-                    **self._stream_inference_kwargs(),
+                    **self._stream_inference_kwargs(chunk_index=idx),
                 )
                 timer.mark(f"inference_chunk_{idx} ({len(self._frame_archive) - frame_idx_before} frames)")
 

@@ -221,10 +221,11 @@ class Avatar:
     def process_frames(self, res_frame_queue, video_len, skip_save_images, frame_sink=None, stream_fps=None):
         print(video_len)
         frame_interval = 1.0 / stream_fps if stream_fps else None
+        processed = 0
         while True:
             if _is_cancelled():
                 break
-            if self.idx >= video_len:
+            if processed >= video_len:
                 break
             try:
                 loop_start = time.time()
@@ -255,6 +256,7 @@ class Avatar:
             if skip_save_images is False:
                 cv2.imwrite(f"{self.avatar_path}/tmp/{str(self.idx).zfill(8)}.png", combine_frame)
             self.idx = self.idx + 1
+            processed += 1
 
     @torch.no_grad()
     def inference(
@@ -270,6 +272,7 @@ class Avatar:
         ramp_batch_size=None,
         ramp_batches=0,
         whisper_chunks=None,
+        reset_avatar_idx=True,
     ):
         os.makedirs(self.avatar_path + '/tmp', exist_ok=True)
         print("start inference")
@@ -300,7 +303,9 @@ class Avatar:
             print("No audio frames to process.")
             return
         res_frame_queue = queue.Queue()
-        self.idx = 0
+        if reset_avatar_idx:
+            self.idx = 0
+        latent_offset = self.idx
         process_thread = threading.Thread(
             target=self.process_frames,
             args=(res_frame_queue, video_num, skip_save_images, frame_sink, stream_fps),
@@ -311,6 +316,7 @@ class Avatar:
             whisper_chunks,
             self.input_latent_list_cycle,
             effective_batch_size,
+            delay_frame=latent_offset,
             first_batch_size=effective_first_batch_size,
             ramp_batch_size=effective_ramp_batch,
             ramp_batches=effective_ramp_batches,
